@@ -1,0 +1,524 @@
+# Process Learnings (PL Catalog)
+
+This is the carry-forward catalog every implementer brief draws from. A PL is appended after a cycle when a reviewer surfaced a failure mode the list didn't cover and that met the substantive rule ([README](README.md)): a wrong or mislabeled number in a report, a documented command that fails, or red CI.
+
+Each entry:
+- **Catalog line** — one-line label suitable for citing in a brief ("PL1 delta-window scraping")
+- **Why** — what failure mode this prevents
+- **How to preempt** — the least code or structure that applies the lesson
+
+Code comments cite PL numbers, so a PL is never renumbered and its heading never deleted. A PL whose subject was removed, or that prescribed machinery the campaign does not need, is **retired**: its body is one line saying why, plus the one sentence that still holds, if any. Briefs never cite a retired PL. The 2026-10 editing pass (PR #110) retired PL55 to PL60, PL62 and PL63 and rewrote the PLs that prescribed the machinery it removed; PL64 is its lesson, and its review added PL65 and PL66.
+
+## Observation labels
+
+Code comments, PLs and the [campaign records](../campaigns/) cite these labels from the June 2026 campaigns.
+The BLOCKER and FINDING labels come from the 2026-06-17 4-cluster ROSA shakeout (1 hub + 3 spokes);
+its findings log was removed once every finding was fixed or superseded.
+
+| Label | Meaning |
+|---|---|
+| O1 | Propagation P3 measured canary pod boot, not propagation. Fixed with a pre-warmed backer and a label flip at t0 (PL30). |
+| O2 | Thin P1 histogram quantiles at `--watcher-replicas 1`. Raise the watcher replica count for robust quantiles. |
+| O3 | Scrape-skew outliers at high port-forward counts. Fixed with the `FANOUT_MAX_SKEW_MS` ceiling (PL8). |
+| O4 | Churn `conv_remote` included scale-up pod readiness. Fixed by adding the control-plane-only `convergence_remote_eds_ms`. |
+| O5 | The istiod CPU request reserved node CPU the test pods needed (`FailedScheduling`). The request only affects scheduling, not measurements. |
+| O6 | Probe fault tolerance: record a failed probe or step as a row status and continue the sweep (PL32, PL40). |
+| O7 | Graded per-metric coverage: a partial scrape would N/A only the affected columns. Proposed, not implemented. |
+| O8 | Runtime pass: deploy once per mesh size and apply setup concurrently (PL34). |
+| O9 | Scale coverage: capacity and %-of-limit columns, the achieved-scale block, and the `SCALE_*` sizing knobs (PL35, PL36). |
+| O10 | A churn-dataplane cleanup timeout made the next mesh size's setup fail. Fixed by waiting out a Terminating namespace in setup (PL37). |
+| O11 | Namespace teardown still exceeds the cleanup bound at higher pod counts. Harmless since O10. |
+| BLOCKER #1 | The Argo CD hub cluster cache failed on the malformed ACM/MCE 2.11.2 clusterview `UserPermission` model in `/openapi/v2`, so the app-of-apps never synced. Argo CD loads `/openapi/v2` unconditionally and no exclusion or setting skips it, so only MCE ≥ 2.11.3 fixes it (checked by `terraform/platform/scripts/001-openapi-preflight.sh`). Do not disable `server-foundation`: it breaks spoke import. |
+| BLOCKER #2 | Cross-cluster data plane failed on ROSA with VPC peering off: the istio-system `topology.istio.io/network` label was empty and the east-west gateway was a NodePort. Fixed by the namespace network label and a LoadBalancer east-west gateway (now the default). |
+| FINDING #3 | The controlplane sweep hit a capacity ceiling: the per-pod sidecar CPU request (100m) times the pod count, not istiod, is the binding constraint. The capacity formula is in [the campaign runbook](../scale-test-campaign/README.md). |
+| FINDING #4 | The metrics API was unavailable right after heavy istiod and namespace churn, so the utilization columns went N/A. Let metrics-server settle before a sweep. |
+| FINDING #5 | Convergence and queue histogram quantiles reported bucket floors (100 ms) at small scale. Fixed by interpolating within the matched bucket, plus a single-bucket caveat. |
+
+---
+
+## PL1 — Delta-window scraping for cumulative istiod metrics
+
+**Why:** Prometheus metrics on istiod (`pilot_xds_pushes`, `pilot_k8s_cfg_events`, `process_cpu_seconds_total`, histogram `_bucket`/`_sum`/`_count`) are cumulative since the process started. Reading once per sweep point gives the lifetime total, not the work-during-the-window. Cross-row comparisons of cumulative values are meaningless.
+
+**How to preempt:** Scrape `/metrics` twice (baseline before work, final after settle), persist both files, compute deltas. Histogram quantiles must be computed on per-bucket *deltas*, not on the raw bucket counts.
+
+## PL2 — TSV preamble with run metadata
+
+**Why:** Without provenance metadata, a TSV row 3 months later is uninterpretable. "Was this an Istio 1.27 run or 1.28? Same harness commit as last week or a hacked-up branch?"
+
+**How to preempt:** Every TSV-writing script emits a preamble block, through the shared emitters (PL36):
+```
+# RUN_ID=<UTC timestamp>-<$$>
+# HARNESS_SHA=<git describe --always --abbrev=7>[-dirty.<8hex>] (harness_sha, tests/lib/common.sh)
+# ISTIO_VERSION=<the version the members run, read live>        ISTIO_VERSION_PIN=<config/versions.env>
+# KUBE_VERSIONS=<ctx=version,...; unreachable or unknown where a read failed>
+# SETTLE_SEC=<value>   (and every other knob that affects the result)
+# (the run config and the platform record: config_preamble_lines, platform_preamble_lines)
+```
+Use UTC timestamps. `-dirty.<8hex>` marks a change git lists under `tests/`, `config/`, `charts/` or `terraform/` (submodules, an untracked note under `docs/` and the run's own results dir never count); the hex hashes the change itself, so two different edits are two harnesses. A sweep reads `HARNESS_SHA` at its start and at its end; a change is a problem in its outcome (exit 4). `ISTIO_VERSION` is read live (`istio_version_resolve` / `istio_version_kv`), never the pin passed off as the live value; a value that could not be read is `unknown`.
+
+## PL3 — Wall-clock window distinct from operator settle
+
+**Why:** The actual elapsed time between baseline and final scrapes is rarely exactly `--settle` (scrape latency, settle drift, async cluster ops). Using the operator's intent as the rate denominator overstates or understates the rates.
+
+**How to preempt:** Capture per-context request-start and request-end timestamps; compute `scrape_window_sec = (min(final.start) − max(baseline.end)) / 1000`. Emit as a TSV column. Keep `settle_sec` (operator intent) as a separate column. Use `scrape_window_sec` as the denominator for `*_rate` columns.
+
+## PL4 — Await async cluster ops
+
+**Why:** Namespace deletion is async (`Terminating` can take minutes). A cleanup script that returns when the delete is *accepted* races the next combo's setup; residual istiod state pollutes the next baseline.
+
+**How to preempt:** Cleanup scripts poll `kubectl get ns -l app.kubernetes.io/instance=<suite>-test -o name` (or equivalent) with a 180-300s timeout until empty. Surface timeouts as a row status (e.g. `DRAIN_TIMEOUT`), not as a `|| true`-swallowed warning.
+
+## PL5 — Server-side apply for large workloads
+
+**Why:** `kubectl apply -f -` uses the client-side `last-applied-configuration` annotation, which has a 256 KiB per-object limit and renders the full manifest stream into kubectl memory. At 5k+ services the pipe builds a GB-class stream and OOMs.
+
+**How to preempt:** `kubectl apply --server-side --force-conflicts -f -`. Use `--dry-run=client` only for dry-runs.
+
+## PL6 — Per-sweep output subdir
+
+**Why:** A flat `results/` directory mixes back-to-back sweeps. The report aggregator globs all matching TSVs and silently conflates configurations.
+
+**How to preempt:** The sweep orchestrator (`003` or `004`) mints `RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$` and creates `${OUTPUT_DIR_BASE}/sweep-${RUN_ID}/`. Passes the subdir as `--output-dir` to the probe and `--results-dir` to the report.
+
+## PL7 — Plural-CSV on sweep scripts with singular alias + deprecation warning
+
+**Why:** Sweep scripts iterate axes (CSV input); standalone setup scripts take one config (singular). Naming mismatch between them trips operators. Renaming a flag mid-project loses muscle memory.
+
+**How to preempt:** Sweep scripts accept `--<axis>s CSV` (plural). Provide singular `--<axis>` as a one-value alias. When the singular form is used, print a stderr deprecation warning naming the canonical plural form.
+
+## PL8 — Concurrent multi-context scrapes with `scrape_skew_ms`
+
+**Why:** Serial per-context scrapes at scale build seconds of drift between the first and last cluster's snapshot. Counter deltas later attributed to "this combo's window" mix in that drift.
+
+**How to preempt:** Fan out scrapes with `&` + `wait`. Record per-pod/per-context scrape **completion** timestamps (in `tests/lib/fanout.sh`, `now_ns` is stamped after `_fanout_scrape_one` returns). Emit `scrape_skew_ms = max(ts) − min(ts)` across the per-context files (NOT the total batch wall-clock).
+
+**Completion- vs start-stamping (deliberate):** completion-spread is the more *conservative* coherence signal. A `/metrics` snapshot is only coherent if all bodies were *read* close together — a cumulative counter can advance between a fast read and a slow read of the same batch, so the spread of *completions* bounds how stale the earliest body is relative to the latest. Start-stamping would measure only subshell-dispatch jitter (tens of ms) and would NOT catch a curl that queued for seconds behind dozens of port-forward proxies. Keep completion-stamping as the gating signal; if a start-spread diagnostic is ever wanted, record BOTH spreads but gate on completion.
+
+**Bound the skew, don't just record it (O3):** `scrape_skew_ms` is provenance only unless something gates on it. A single batch whose completion-spread approaches the curl timeout (e.g. one curl near `FANOUT_METRICS_TIMEOUT` at ~50 concurrent port-forwards → multi-second skew) yields counter/histogram deltas computed across an incoherent snapshot, and the row counts toward averages with no flag. Add a `FANOUT_MAX_SKEW_MS` ceiling (default 1000 — above the ~100–350 ms normal spread, below the multi-second outlier, above the ~2 s P1/P2 signal floor) and, when a batch exceeds it, tag the row via the **existing** incomplete/poison plumbing (`SCRAPE_INCOMPLETE` / `POISONED_SCRAPE`) so the report filters it. `tests/lib/fanout.sh` persists each batch's skew to a `<prefix>.skew` sidecar and exposes `fanout_skew_high_value <skew_ms>` (prints 1 when the skew exceeds `FANOUT_MAX_SKEW_MS`, else 0); keep the skew-computing awk pass byte-identical (PL22) and still emit the raw skew in the TSV for provenance.
+
+## PL9 — istiod restart detection: `0 | 1 | unknown`
+
+**Why:** A mid-window istiod restart resets every counter to 0. The resulting deltas are nonsensical (negative, or "near baseline"). Without a restart flag the report silently produces wrong numbers.
+
+**How to preempt:** Read `process_start_time_seconds` baseline + final per context. Emit `istiod_restarted` as:
+- `1` — `final > baseline` (restart detected)
+- `0` — both present, equal
+- `unknown` — either side missing (don't claim "no restart" when you couldn't measure)
+
+Report aggregator filters BOTH `1` and `unknown` from numeric averages and surfaces a count.
+
+## PL10 — Matrix safety cap + `--force-large-matrix`
+
+**Why:** Operators routinely typo a sweep input that produces a thousand-combo matrix. Without a gate, a misclick burns a multi-day run.
+
+**How to preempt:** Sweep orchestrators compute the cross-product size upfront and refuse to run if it exceeds `CONTROLPLANE_MAX_MATRIX` (default 64). `--force-large-matrix` bypasses with an explicit acknowledgment. The error message names the actual size AND the factor breakdown so the operator can fix the typo.
+
+## PL11 — Histogram metrics handled as histograms, not counters
+
+**Why:** `pilot_xds_config_size_bytes` (and similar) emit `_bucket`, `_sum`, `_count` lines. Summing all matching lines as a "counter total" double-counts the bucket rows and yields a meaningless number.
+
+**How to preempt:** For "average payload" use `(_sum.final − _sum.baseline) / (_count.final − _count.baseline)`. For percentiles, use the standard bucket-walking algorithm on per-bucket deltas (see PL14 for the negative-bucket guard).
+
+## PL12 — Gauge extraction sums across label permutations
+
+**Why:** `pilot_xds` (connected proxies) and similar gauges are emitted with labels like `{type="ads"}`. A regex that exits after the first match returns one permutation's value instead of the total.
+
+**How to preempt:** Gauge extractors `accumulate $NF` across all matching lines, not just the first. Document in a comment that the metric must be name-anchored so it doesn't prefix-collide with `_pushes` / `_config_size_bytes` etc.
+
+## PL13 — Restart guard on counter deltas + histogram quantiles
+
+**Why:** Even with PL9 restart detection, the numeric delta columns will contain garbage values for restarted-mid-window rows. If the aggregator includes them, the average is poisoned.
+
+**How to preempt:** When `istiod_restarted == "1"` (and also `"unknown"`), the probe emits `N/A` for every counter delta and histogram quantile in that row. The aggregator skips rows where `restarted != 0` from numeric averages but still counts them in `n_total`.
+
+## PL14 — Negative histogram bucket delta → `N/A`
+
+**Why:** Final < baseline in any `le=` bucket (counter rotation, label-set drift, mid-window restart not yet flagged) produces a non-monotone CDF; walking it for a target quantile returns nonsense.
+
+**How to preempt:** The histogram-quantile extractor checks each per-bucket delta; if any is negative, emit `N/A` (don't attempt to repair monotonicity — `N/A` is the honest signal).
+
+## PL15 — Report aggregator filters poisoned rows; emits `n_total` and `n_valid`
+
+**Why:** Operators need to see both "how many samples did we attempt" and "how many survived the filters". A report that silently drops poisoned rows hides the failure rate.
+
+**How to preempt:** The aggregator counts `n_total` (all rows for the cell) and `n_valid` (rows passing the filters: `restarted=0`, `status=OK`, `overflow=0`, etc.). Both columns appear in every output format, and the report's body says so when a cell has `n_total > n_valid`.
+
+## PL16 — Bash/awk-only deterministic seeded shuffle (no `shuf`)
+
+**Why:** `shuf` is non-deterministic by default AND not on the agreed tool list. Two sweeps with the same args pick different random samples, breaking reproducibility.
+
+**How to preempt:** Implement a deterministic shuffle in awk (LCG or hash-by-key) seeded from `RUN_ID + context_name`. Pick top-N from the sorted list. Same seed → same picks.
+
+## PL17 — Sample-count column format: `got/attempted`
+
+**Why:** When a column records partial successes, recording only `got` is indistinguishable from "configured low" — operators can't tell whether 2 of 3 samples failed or whether `--config-dump-samples 1` was passed.
+
+**How to preempt:** Format as `<got>/<attempted>` consistently across code, TSV, README, and report. Document the order; an inverted order in the README would be worse than no docs.
+
+## PL18 — Settle gap between cleanup and next combo setup
+
+**Why:** Even after PL4 confirms namespace deletion completed, istiod is still draining the push context for the just-deleted workloads. The next combo's baseline scrape lands inside this drain storm and inflates the deltas.
+
+**How to preempt:** The orchestrator sleeps `--settle SEC` (or a fixed minimum) after `005` returns and before the next combo's `001` starts. This is in addition to the within-combo settle between baseline and final scrapes.
+
+## PL19 — Report metadata propagation to all 4 output formats
+
+**Why:** The TSV preamble (PL2) is provenance gold, and the sweep's record (`sweep-outcome.txt`) says whether the run behind the numbers finished, failed cells or recorded a problem. If the report drops either, a reader of the report alone can't reconstruct what was measured, or learn that the run failed.
+
+**How to preempt:** The report (`004` or `005`) carries every preamble key forward, not just `RUN_ID` and `HARNESS_SHA` (several inputs: PL26):
+- `text` / `csv` — `# KEY=VALUE` lines above the data
+- `markdown` — YAML frontmatter (`---\nKEY: VALUE\n---`)
+- `json` — top-level `metadata` object alongside `results` array
+
+and prints each input dir's sweep record in every format (`sweep_outcome_lines`, `tests/lib/common.sh`).
+
+Pass a string field to awk through `ENVIRON` (`K="$v" awk '... ENVIRON["K"] ...'`), never `awk -v k="$v"`: `-v` processes backslash escapes, so a value with a `\` reaches awk changed (`\t` becomes a tab, `\\` one backslash, a lone trailing `\` a warning) and the report prints another value than the TSV holds. Quote it for JSON with the one lib escaper, `JSON_STR_AWK` (`function js(x)` in `tests/lib/common.sh`, `awk "${JSON_STR_AWK} ..."`), not a local copy (`tests/lib/verify.sh` flags copies). Round 3 found the `-v` form in three JSON writers.
+
+## PL20 — Multi-push detection thresholds
+
+**Why:** A `delta._count >= source_proxy_count` threshold for "convergence detected" assumes one push per Service apply. Istiod batches: a Service+Endpoints apply commonly produces CDS + EDS + Sidecar-recompute pushes. The flat threshold satisfies at *partial* convergence.
+
+**How to preempt:** Either (a) scale the threshold by observed `pilot_xds_pushes` delta (`target = proxy_count * pushes_delta`), or (b) filter `pilot_xds_pushes{type="eds"}` specifically when the goal is endpoint discovery. Document the choice with an inline comment.
+
+## PL21 — Single-scrape consistency for gauge + histogram pairs
+
+**Why:** If `proxy_count` is read in one scrape and the histogram baseline in another, a proxy connecting/disconnecting between them invalidates the threshold. The same race applies to any pair of values that must come from the same istiod snapshot.
+
+**How to preempt:** Parse all needed fields from a single `/metrics` scrape blob. No second HTTP round-trip for gauges when a baseline blob is already in hand.
+
+## PL22 — Single awk pass per scrape, not multi-pipe
+
+**Why:** Hot-path scrapes do 4× `echo "$metrics" | awk` per tick (one per extractor). At MB-sized payloads × N contexts × 4 Hz polling, that's hundreds of MB/s of subshell churn on the harness host — probe-self-noise.
+
+**How to preempt:** Scrape to a tempfile once per tick. One awk pass emits all needed fields (gauge values, counter values, histogram buckets, process_start_time, etc.) in a structured KV format the caller reads.
+
+## PL23 — Drain/cleanup timeouts propagate as row status
+
+**Why:** When `wait_sidecar_endpoint_removed` (or equivalent) times out, returning `|| true` and emitting a warning lets the next iteration's baseline include the un-drained workload. The report has no idea the row is contaminated.
+
+**How to preempt:** Timeout → emit a row with `status=DRAIN_TIMEOUT` (or `CLEANUP_TIMEOUT`); the report aggregator filters non-OK status from numeric aggregation alongside `restarted` and `overflow`. Exception: a drain that times out *after* the measurement window does not invalidate that iteration, whose values were measured before the drain. Keep them and flag the row (propagation: `DRAIN_TIMEOUT` supersedes only `OK`), and have every report say how many iterations drained late; dropping them would cut the slow tail, since a slow removal and a slow add share istiod's push path. What needs protecting is the next iteration: a drain check before its baseline (still healthy → `NOT_DRAINED`, left out), and a settle after a timed-out drain even when that check reads clean.
+
+## PL24 — Window must cover the deploy storm, not just the settle
+
+**Why:** A delta-window that starts *after* the setup script returns misses the entire push-storm period — istiod is back to idle by then. Even cumulative-counter deltas read near-zero, and quantiles over the resulting bucket-counts include only the settle period.
+
+**How to preempt:** Split the probe into `--phase baseline | final` with a `--state-dir` to ferry baseline files across the setup step. The orchestrator calls `baseline` *before* `001`, then `001`, then sleeps settle, then `final`. The wall-clock window now spans the entire deploy + settle.
+
+(PL24 was added after the homelab CPU-spike data on PR #2 — see `tests/controlplane/README.md` "What it measures" for the resulting orchestration.)
+
+## PL25 — Drop snapshots that read idle
+
+**Why:** Once a delta-window measurement exists for a quantity (e.g. `cpu_m_delta` from `process_cpu_seconds_total`), keeping the *kubectl-top snapshot* as a "spot check" doesn't add information — the snapshot reads ~1-2 m on idle istiods regardless of the work that just happened, so it's just noise that invites confusion about which column to trust.
+
+**How to preempt:** When the delta-window version of a metric is added, *remove* the snapshot version from the schema, not "demote it to informational". Keep snapshots only for gauges (memory, connected_proxies) where a single observation is genuinely representative.
+
+(PL25 was added after PR #2's third round of feedback — `cpu_top` was demoted to spot-check, then removed entirely.)
+
+## PL26 — Multi-input report preamble: scalar/sequence partition
+
+**Why:** PL19 propagates the TSV preamble into all four report formats, but when a sweep feeds N per-iteration TSVs into one report, the naive "last-value-wins per key" aggregation collapses per-iteration scalars (`RUN_ID`, `DATE`, `MESH_SIZE`, `REMOTES`, `KUBE_VERSIONS`) to whichever input file sorted last. The resulting frontmatter advertises *one* iteration's identity (e.g. `MESH_SIZE: 2`) while the report body summarises the whole sweep (e.g. comparison table listing sizes 1, 2, 4, 8). Operators reading the report file detached from its directory are actively misled about provenance.
+
+**How to preempt:** Classify preamble keys into two partitions before propagation:
+- **Sweep-level scalars** — values every input TSV of one run must share (`SWEEP_RUN_ID`, `HARNESS_SHA`, `ISTIO_VERSION`, sweep-wide knobs like `SETTLE_SEC`/`TIMEOUT_SEC`/`ITERATIONS`), rendered as scalars at the top of the metadata block. When the inputs disagree, the value reads `mixed:<a>,<b>` and the report warns; never last-wins.
+- **Per-iteration values** — keys that legitimately vary across the N inputs (`RUN_ID`, `DATE`, `MESH_SIZE`, per-iteration `REMOTES`/`KUBE_VERSIONS`), rendered as a sequence with one entry per input TSV (`iterations:` in markdown/text, `# iterations:` in CSV, `"iterations":[...]` in JSON); a single-input report renders a one-element sequence.
+
+The sweep threads its `SWEEP_RUN_ID` into every TSV it writes (a standalone probe omits the line) and the report emits it as the first scalar key. The `mixed` value and its warning are the whole check.
+
+(PL26 was added after PR for issue #11: the propagation sweep was refactored to use the report script for markdown summary; round-1 reviewers (usability + reproducibility) caught that PL19 propagation alone is insufficient when N TSVs feed one report.)
+
+## PL27 — Scope Helm renders to the resources being mutated
+
+**Why:** When a probe script uses `helm template | kubectl apply` to create or update a single resource (e.g. a canary Deployment), the default `helm template` renders the *entire* chart — including resources the probe doesn't own (e.g. watcher Deployments). Server-side apply with `--force-conflicts` then overwrites those resources with the chart's default values, silently reverting operator-configured settings (like `replicaCount`) on every iteration.
+
+**How to preempt:** Use `helm template --show-only templates/<file>.yaml` to scope the render to only the templates the probe needs. This is especially important when the chart contains resources managed by a separate setup script with its own CLI flags (e.g. `--watcher-replicas`). The probe must not re-apply resources it doesn't own.
+
+(PL27 was added after PR #2: the propagation probe's `helm template` rendered the full chart each iteration, overwriting watcher Deployment `replicaCount` from 30 back to the chart default of 1, dropping connected proxy count mid-sweep and losing histogram quantile data.)
+
+## PL28 — Multi-replica istiod fanout: gauge sum-vs-invariant classification
+
+**Why:** When a probe scrapes a single istiod (`svc/istiod` port-forward → one replica), every metric is read from one pod. The moment the control plane is pinned to N replicas and the probe fans out (scrapes every istiod pod), aggregation acquires a SECOND axis — across pods — and metrics split into classes that aggregate differently. Summing the wrong class silently N×'s or undercounts a value. Specifically: `connected_proxies` (`pilot_xds`) is per-replica (each proxy holds exactly one istiod connection) and must **sum across replicas**, while `pilot_services` (and any mesh-global registry gauge) is **identical on every replica** and must be treated **invariant (max/any), NOT summed** — summing it 5×'s the service count and breaks any "services delta ≥ 1" clean-check. Compounding trap: PL12's `extract_gauge` returns the *last* matching line, not a within-pod sum across label permutations — so a naive `fanout_gauge_sum` built on it is a double no-op (wrong within-pod, then summed across pods).
+
+**How to preempt:** Provide an `extract_gauge_sum` that accumulates `$NF` across all name-anchored permutations within a pod (don't reuse `extract_gauge`, which is last-match). Then classify each gauge: SUM-across-pods (`connected_proxies`) vs INVARIANT/max-across-pods (`pilot_services`). Counters always sum across pods (each event emitted by one replica). Histograms sum per-bucket counts across pods *before* computing deltas/quantiles (never average per-pod quantiles). Restart detection fires on ANY pod restart OR pod-set change. Unit-test the sum-vs-invariant distinction once, with fixtures carrying MULTIPLE label permutations per pod (e.g. `pilot_xds{type=ads}`+`{type=grpc}`) so the within-pod axis is actually exercised.
+
+(PL28 was added after the istiod-fanout PR: round-1 measurement + istio reviewers caught that the cross-pod gauge sum was built on `extract_gauge`'s last-match behaviour and that `pilot_services` would be 5×'d if summed like `pilot_xds`.)
+
+## PL29 — Empty/short fanout scrape must be distinguishable from a legitimate zero
+
+**Why:** With one scrape per measurement, a failed scrape is obvious (the whole probe errors). With a fanned-out scrape of N pods, a single dead/slow port-forward writes an EMPTY `/metrics` file that every summing aggregator silently treats as 0 — so the summed value (e.g. `pilot_xds`, the P1 convergence-threshold denominator `Σ delta_count ≥ Σ proxy_count`) drops by ~1/N and the probe "converges" early on a smaller target, emitting plausible-but-wrong latency with no failure flag. At 10 contexts × 5 replicas ≈ 50 port-forwards over a multi-hour sweep, a PF drop is near-certain. An empty scrape MUST NOT be indistinguishable from a pod that legitimately reports 0.
+
+**How to preempt:** In the fanout scrape helper, reject bodies below a `FANOUT_MIN_SCRAPE_BYTES` floor (a truncated 200-byte body is a failure, not a zero), retry each failed pod ONCE in-tick (reopen the port-forward), persist the still-failed pod count (e.g. `<prefix>.failed`) and return non-zero. The probe reads the failed count and, when non-zero, skips the convergence test for that tick and tags the row `SCRAPE_INCOMPLETE` (or a suite-local `POISONED_*` equivalent) so the report aggregator filters it (alongside `restarted`/`TIMEOUT_*` per PL13/PL15). `fanout_open` should tolerate one unreachable pod (skip it, die only when ZERO replicas serve) so a transiently-Running-not-Ready pod during a rolling restart doesn't abort the whole probe.
+
+(PL29 was added after the istiod-fanout PR: round-1 scale + reproducibility reviewers caught that an empty per-pod scrape was being summed as 0, undercounting the convergence denominator without any row flag.)
+
+## PL30 — Isolate "config propagation" from "workload boot": pre-warm + flip, don't create at t0
+
+**Why:** A probe that measures how fast a *config change* propagates must not start its clock before a *workload* exists. The propagation probe captured `T0` immediately before `helm template | kubectl apply` created a **fresh** canary Deployment+Service every iteration, so the data-plane phase (P3, "remote sidecar has a healthy endpoint") inevitably included pod scheduling + image pull (`:latest`, no readiness probe, no `imagePullPolicy`) + sidecar startup. P3 ran 8–102 s and was non-monotonic — it measured "new workload reachable", not xDS/EDS propagation, and the boot variance swamped the ~2 s control-plane signal. The same trap applies to any suite that stamps `t0` and then *creates* the thing whose propagation it wants to time.
+
+**How to preempt:** Pre-warm the workload in the setup script (`001`): a single already-Ready backer pod with the image **pinned + `imagePullPolicy: IfNotPresent`**, the sidecar up, and a `readinessProbe`, NOT yet selected by the Service. Gate Service membership on a separate **active-flip label** (the Service selects on the stable pod label **AND** `…-active: "true"`), so the backer is Ready-but-unselected until `t0`. At `t0`, capture the pod **before** setting `T0`, then do a **config-only** mutation — `kubectl label pod <pod> <key>=true --overwrite` (PL5 server-side) — so the endpoint appears via an EDS push with no reschedule. Drain = remove the label (`<key>-`); the backer stays warm for the next iteration and the Deployment/Service persist. Keep ONE shared `T0` across all phases so they stay comparable, and render only the templates being shown/applied (PL27). Watch two follow-on traps the new topology introduces: (a) the Service now persists across iterations, so a data-plane "drained?" check that waited for the *cluster name* to disappear from Envoy `/clusters` must instead wait for the absence of a **healthy** endpoint (the inverse of the detection match); (b) guard that the backer is genuinely `Ready` before `t0` (a flip onto a not-yet-Ready pod re-introduces the boot latency the pre-warm was meant to remove).
+
+(PL30 was added after campaign observation O1: the propagation P3 phase was measuring canary pod boot, not propagation. The fix pre-warms a backer and flips a label at t0.)
+
+## PL31 — A topology change silently invalidates secondary "is-this-clean" discriminators; the naive fix samples one causal step too early
+
+**Why:** PL30 names two *data-plane* follow-on traps of the pre-warm+flip topology. There is a third, on a *different phase's* dirty/cleanliness discriminator. The propagation P2 phase (remote registry discovery) flagged a row dirty when an EDS bump arrived **without** an accompanying `pilot_services` gauge delta ≥ 1 — a correct "this was unrelated churn, not our change" test **only while t0 *created* a new canary Service** (the registry gained a Service → `pilot_services` +1). Under the PL30 label-flip topology the Service is created once in `001` and **persists**, so at t0 the flip adds only an *endpoint*, the `pilot_services` delta is always 0, **every** row is flagged dirty, and the report silently drops the entire P2 column — a structurally-empty metric masquerading as "filtered for quality". Compounding trap (caught a round later): the obvious fix — replace the stale discriminator with the canary's `health_flags::healthy` signal sampled **at the EDS-bump instant** — re-introduces the bias from the opposite side, because the confirming signal is **causally downstream** of the trigger: istiod increments `pilot_xds_pushes{type=eds}` when it *issues* the push, but the sidecar reports `health_flags::healthy` only after it *applies* it, and that lag *is* the P2→P3 gap being measured. So a genuinely-clean iteration reads "not healthy yet → dirty" and the column collapses again.
+
+**How to preempt:** When a probe's t0 trigger changes shape (create→config-only mutation, or any analogous reshaping), audit **every downstream discriminator** — dirty flags, cleanliness gates, drain detectors, threshold denominators — not just the headline metric. For each, name the side-effect of the *old* trigger it was keyed to, and re-derive it for the *new* trigger. For an "is this measurement ours/clean" discriminator, gate on the window's **terminal outcome** (did the thing converge by end-of-window?), never on an instantaneous read at the trigger instant when the confirming signal is causally downstream of the trigger. Prefer reconciling against an **existing phase's terminal result** (here: `p2_dirty = p2_ms numeric AND p3_ms non-numeric` — "EDS bumped but the canary never went healthy in-window") over adding a second consumer that races the authoritative poller on the same port-forward. Lock the predicate with an inline truth-table comment so a later refactor can't silently re-break it.
+
+(PL31 was added after the O1+O3 review cycle: round-1 istio caught that the label-flip topology always-dirtied P2 because the discriminator was keyed to the old create's `pilot_services` delta; round-2 istio caught that the naive `health_flags::healthy`-at-bump fix sampled the replacement signal one causal step too early. Fixed by reconciling `p2_dirty` against the P3 terminal outcome.)
+
+## PL32 — Under `set -e`, EVERY per-combo orchestrator step is a whole-sweep killer — wrap them all, and the likeliest killer is setup, not the probe
+
+**Why:** A multi-hour sweep orchestrator runs a sequence of step scripts per combo (`001-setup`, the `002` probe, `005`/`006` cleanup, and for tuning `001-apply-profile`/`002-revert-profile`). Each is a bare `"$SCRIPT_DIR/0NN-….sh"` call under `set -euo pipefail`, so a single non-zero exit aborts the *entire* sweep at that combo — and because reports run only *after* the loop, an abort at combo 50/200 discards all 49 completed combos of overnight data. Hardening only the *probe* call (the obvious one) leaves the others live: at scale (~50 port-forwards, hundreds of combos) the **setup/deploy** step (`helm template|apply` + label-selector `kubectl wait` timeouts) is the *most probable* per-combo failure, more likely than the probe.
+
+**How to preempt:** Start every per-combo step through `sweep_step` (PL45) and guard it: `if ! sweep_step "$SCRIPT_DIR/0NN-….sh" …; then warn; <placeholder row>; FAILED_CELLS+=(<STATUS>); cleanup; settle; continue; fi`. The placeholder row goes into the cell's **real** `(axis…)` bucket with its status (`SETUP_FAILED`/`PROBE_FAILED`: in `n_total`, not `n_valid`, PL15), N/A numerics and `restarted=unknown` (PL13), so a crashed combo is never silently *absent* from the report (indistinguishable from never-planned). Pass the failed statuses to `sweep_finish`: the sweep's record names them, every report prints it (PL19) and the sweep exits 4. On a setup-failure path, also stop what the success path would (e.g. a background metrics poller started before the step) before `continue`. Write the TSV preamble before the first step (PL36), so a first-combo failure keeps the run's provenance. Reserve `die` for whole-run preconditions only (bad args, missing tools, zero istiod across ALL contexts).
+
+(PL32 was added after the O6 fault-tolerance cycle: round-1 wrapped the probe calls but the scale lens found `001-setup` bare in all 5 orchestrators — the likeliest sweep-killer — plus a fully-crashed mesh size vanishing from the report and a baseline-failure mis-bucketing to a phantom cell; later rounds wrapped setup + tuning apply/revert and added placeholder rows. Lesson: harden the *whole per-combo step sequence*, not just the headline call.)
+
+## PL33 — A regression guard must be verified end-to-end through its real entrypoint against a live positive instance — not just its inner unit
+
+**Why:** A lint/check added to prevent a class of bug gives **false confidence** if it passes its own unit test but is never actually dispatched to the file it was meant to guard. The O6 orchestrator-step lint was generalized specifically to catch tuning's bare step calls, and its direct-invocation regression test passed — but the production entrypoint (`lint_bare_scrape_paths`, what `verify.sh` runs) dispatched the check only to `*-run-sweep.sh`, which does **not** match `003-run-tuning-sweep.sh`. So the guard was toothless for the exact file it was added for, while every signal (unit test, `verify.sh` green) said "covered." A second bug hid behind it: the guard's "is this call guarded?" test read only the first physical line, so a `\`-continued statement with its `||` guard on a later line was a false positive — which would only have surfaced *after* the dispatch gap was closed.
+
+**How to preempt:** Validate a new guard the way an adversary would: (1) run it through the **production entrypoint** (the command `verify.sh`/CI actually invokes), not just the inner function; (2) prove it **fires** by introducing a live positive instance (temporarily un-guard a real call) and confirming the entrypoint reports it, then restore; (3) confirm its **dispatch/glob actually matches** every target file (enumerate what the glob matches vs the files that exist); (4) test multi-line / continuation forms, not just single-line fixtures. A guard that can't be shown to fail on a real violation isn't a guard. And when a reviewer claims "the gate fails/passes," reproduce the exit code before acting — the stated mechanism may be the symptom of a deeper escape.
+
+(PL33 was added after the O6 cycle round-4: the conventions reviewer reported the lint failed `verify.sh` on guarded tuning code; reproducing the actual exit codes revealed the opposite — `verify.sh` passed because the lint never reached tuning at all (dispatch-glob gap), masking a real multi-line-guard false positive. Both were fixed only because the claim was reproduced against real exit codes rather than acted on directly.)
+
+## PL34 — "Deploy once, sweep an inner axis" is only fidelity-neutral if you restore the per-iteration starting state the probe assumes — and a failed restore is a new silent-contamination path
+
+**Why:** A big wall-clock win is to hoist setup/teardown out of an inner sweep loop and reuse one deployed workload across the inner axis (e.g. churn-dataplane deploying once per mesh-size and sweeping all churn rates on it, instead of redeploy-per-rate). But "reuse the workload" is **not** the same as "reproduce the measured conditions." The inner-axis probe almost always assumes a specific *starting state*: churn-dataplane's `003` initializes its per-target PARITY tracker to all-base and toggles from there, and it never resets replicas at the end — so after one rate the churn-targets are left in a **mixed** state. Naively reusing that workload for the next rate (a) contaminates the next rate's **baseline** (it now measures a non-all-base mesh — a "no baseline reuse" violation in disguise), and (b) **desyncs the probe's own state model**: PARITY=0 issues `scale --replicas=scale-to` against deployments already at scale-to → no-op scales → **undercounted EDS/xDS push deltas**. The fresh redeploy you removed was silently providing that clean starting state.
+
+**How to preempt:** Before each inner-axis iteration after the first, explicitly **restore the exact starting state a fresh deploy gave** (here: `kubectl scale -l <workload-selector> --replicas=<base>` on every active context, scoped by a label that excludes the measurement workload), then **drain** the restore's own control-plane activity with the existing inter-iteration settle before measuring. Keep the per-iteration baseline. Crucially, the restore is itself a cluster op that can fail — and a *failed* restore is a brand-new failure mode that the redeploy-per-iteration design could never have. Treat it like a setup failure: have the restore **report** non-zero (don't swallow it best-effort), and on failure record a degraded status row (`RESET_FAILED`, counted in `n_total`, excluded from `n_valid` per PL15/PL32) and **skip** that iteration's measurement rather than measuring against a known-contaminated mesh. Bound the restore with a request timeout (PL/O6 `--max-time` discipline) so a hung apiserver degrades to that recorded skip instead of stalling the sweep. Also update every doc that described the old per-iteration structure (README "how the sweep works", the script-table flow, the `--settle` help, the status enum) — a deploy-once restructure changes the operator's runtime/isolation mental model, and stale docs read as "fresh-namespace isolation between every iteration" when there no longer is any.
+
+(PL34 was added after the O8 runtime cycle: round-1 reviewers confirmed the deploy-once refactor was fidelity-neutral *only because* of the reset-to-base guard, but three lenses independently flagged that a *failed* reset silently admitted a contaminated rate into `n_valid` — converted in round-2 to a recorded-and-skipped `RESET_FAILED`, mirroring the O6/PL32 setup-failure philosophy.)
+
+## PL35 — A `%-of-capacity` ratio must share aggregation scope numerator↔denominator; and an "achieved scale" legibility block must mirror the `n_valid` filter, not re-ingest configured/failed rows
+
+**Why:** Adding utilization legibility (a "%-of-limit" column, an "achieved scale" report block) is high-value but has two recurring traps. (1) **Ratio scope mismatch:** the numerator and denominator must be aggregated over the *same* set. istiod usage was summed across *all* replicas (`kubectl top pod -l app=istiod`) while the limit was read *per replica* (`deploy.spec...resources.limits`), so `% of limit` read up to ~R×100% on an R-replica control plane that was actually idle — the metric did not measure what its name claimed. This is the same family as PL28 (sum-vs-invariant for multi-replica istiod): any cross-replica ratio has to multiply the per-replica denominator by the replica count (or average the numerator). (2) **Legibility must mirror validity:** an "achieved scale" block that takes `max()` over *every* row re-ingests the rows the rest of the report already excludes — a `SETUP_FAILED`/restarted row still carries the *configured* axis value (`service_count`) and a mid-reconnect gauge (`connected_proxies`), so the headline read "200 services achieved" when zero deployed. A legibility aggregate over measured data must apply the **same `n_valid` gate** (here `istiod_restarted==0`) the numeric aggregates use; otherwise it reports configured intent as achieved fact.
+
+**How to preempt:** When adding any `pct_of_X` column, write down the scope of both operands and make them match (sum/sum or per-unit/per-unit) — and unit-test the **R>1** path explicitly (a single-replica fixture hides the bug). When adding a report block that summarizes "what we actually achieved," gate its ingestion on the same validity predicate as `n_valid` (skip restarted/failed/degraded rows), and label values honestly (a *configured* axis surfaced as "achieved" should say so). Bump the TSV schema as a clean append (old cols byte-identical, new cols appended), stamp a `…_SCHEMA=<n>` preamble marker so a future same-width-different-semantics schema can't silently mis-aggregate, and skip + count (not silently drop) legacy-width files. Keep the environmental capacity reads OUT of the measurement window and off the default path (legibility always-on and read-only; capacity-*derived sizing* behind a default-off flag) so the change is observability-only until calibrated on a real cluster.
+
+(PL35 was added after the O9 scale-coverage cycle: round-1 istio caught the per-replica-denominator ratio bug and measurement caught the achieved-scale block ingesting `service_count`/`connected_proxies` from `SETUP_FAILED`/restarted rows; both fixed in round-2 by multiplying the limit by replicas and gating the block on `istiod_restarted==0`.)
+
+**Corollary (caught in an O9 fast-follow):** "mirror `n_valid`" applies to *every* surface that aggregates istiod-sourced numbers, not just the new legibility block. The per-combo `aggregate()` in `004` had long gated its **counters/histograms** on `istiod_restarted==0` but ingested the **gauges** (memory, connected proxies, Go heap) unconditionally — the achieved-scale fix gated the headline block while the per-combo table still leaked a restarted row's mid-reconnect `connected_proxies` into `proxies_min/max/avg`. The trap: "gauges are point-in-time so they're always valid" is false across a restart — a gauge read mid-reconnect or just after a fresh start is a transient, just as suspect as a reset counter. When you gate one aggregation site on a validity predicate, grep for *every* `ingest()`/min/max/avg over the same row set and gate them identically; the only metrics that legitimately stay ungated are ones sourced independently of the failed component (here the proxy-side config-dump bytes).
+
+## PL36 — A resilience "pre-create" of a shared artifact silently defeats a `! -f`-guarded fuller initializer: both writers must emit the identical key set
+
+**Why:** To make provenance survive a first-combo failure (PL2/PL26 rationale), an orchestrator may **pre-create** the shared output file before the loop (here `003-run-sweep.sh:precreate_tsv_preamble` writes the TSV preamble up front). But the per-combo collector that *normally* writes that preamble guards its block on `! -f` (here `002`: "only write the preamble if the file doesn't exist yet"). The two interact destructively: once the pre-create runs, the collector's richer initialization is **skipped entirely**, so any key the pre-creator forgot is *never* written — not by the pre-creator (it didn't know about it) and not by the collector (its `! -f` guard short-circuited). The failure is invisible: the file exists, has a valid header, rows append fine, and only a *downstream reader* (`004`'s `preamble_get`) surfaces the gap as `unknown` — far from the cause, looking like a read bug or a metrics-availability problem rather than a write-path omission. In O9 this dropped five capacity-provenance lines (`NODE_ALLOC_*`, `ISTIOD_*_LIMIT`, `SCALE_TARGET_FRACTION`), hollowing out the entire "Achieved scale vs capacity" block on a sweep that read every value fine.
+
+**How to preempt:** When more than one code path writes the same artifact (a pre-creator, a `! -f`-guarded collector, a placeholder-row emitter), every one of them emits each preamble block through **one shared function** (`infra_preamble_lines`, `config_preamble_lines`, `platform_preamble_lines`, `istio_version_kv`), so a key added there reaches every writer and the key sets cannot differ; no test of their symmetry is then needed. Never write a key inline in one writer only. A writer that could not read a key writes `unknown`, never leaves the key out, so a reader can tell "not read" from "not written".
+
+(PL36 was added after the O9 capacity-legibility fast-follow (#45): the 2026-06-04 clean pass reported `node allocatable: unknown / istiod limit: unknown` despite the reads succeeding, because `003`'s resilience pre-create omitted the capacity lines `002` would have written and `002`'s `! -f` guard then skipped its whole preamble block. Fixed by writing the capacity lines in the pre-creator too, recording `SCALE_SIZING_MODE` for downstream reproducibility, and the reproducibility reviewer flagging the residual `ISTIO_VERSION` vs `ISTIO_VERSION_TAG` / `CONTROLPLANE_SCHEMA` asymmetry between the two writers as the same class of latent gap.)
+
+## PL37 — A bounded cleanup that TIMES OUT poisons the NEXT iteration's setup; recording the timeout (PL23) is not enough — the next setup must wait the shared resource out
+
+**Why:** PL23 makes a drain/cleanup timeout *visible* (a `CLEANUP_TIMEOUT` row) instead of silently aborting the sweep — but visibility is not isolation. When the cleanup tears down a **shared, named resource** that the next iteration's setup must **re-create** (here the deploy-once-per-mesh-size `churn-dataplane-test` namespace, which the chart re-applies as a `kind: Namespace`), a cleanup that exceeds its bound leaves that resource mid-teardown (a `Terminating` namespace). The next setup's `kubectl apply` then collides with it — you cannot create a `Terminating` Namespace, nor namespaced resources inside one — and fails *fast*. Under the PL32 setup-wrap that fast failure is correctly recorded as `SETUP_FAILED`, but it wipes **every combo of the next iteration**. Worse, the setup-failure path's *own* cleanup then waits the teardown out, so the iteration *after* recovers — producing a deterministic **odd-✓ / even-✗ oscillation** (in the 2026-06-04 churn-dataplane sweep every even mesh-size lost all 6 of its combos: ~40% data loss) that reads like a flaky-infra problem rather than a teardown/setup ordering bug. The root asymmetry: cleanup was given a bound and an await (PL4), but the *consumer* of the freed resource was not — it assumed the resource was already gone the moment cleanup returned, which is false precisely when cleanup timed out.
+
+**How to preempt:** A slow teardown of a shared resource must **delay** the next iteration, never **destroy** its data. (1) Put a **PL4 poll-until-gone precondition in the setup script itself** (not just the orchestrator): before applying, wait — bounded, reusing the same timeout knob the cleanup uses — for any pre-existing instance of the shared resource to fully disappear on **every** target context. Then a slow teardown becomes a delayed-but-successful setup; only a teardown that *never* completes within the bound degrades to a (now-rare) legitimate `SETUP_FAILED`. Keeping the wait in setup means a manual setup after a manual async cleanup benefits too. (2) Attack the teardown duration at its real dominator so the bound is rarely hit — for a namespace full of **sidecar-injected** pods, pre-delete the workload pods with a **short grace period** before deleting the namespace so istio-proxy drain doesn't serialize into minutes (a *speedup*, best-effort, never a correctness gate — the authoritative `--wait-deletion` poll stays). (3) Treat the cleanup bound and the setup-wait bound as the **same contract** (thread one `--ns-delete-timeout`/`COEXEC_*` value to both) so an operator override applies symmetrically. (4) Watch the tail: with both bounds equal, the worst case is cleanup-exhaust **plus** setup-wait-exhaust on the same iteration (~2× the bound wasted) — acceptable against the data it saves, but if the largest sizes routinely hit it, that is a real teardown-capacity wall, not a setup bug, and should read as such in the report.
+
+(PL37 was added after the churn-dataplane cleanup-cascade cycle: the O8 deploy-once-per-mesh-size refactor moved cleanup from per-rate to per-mesh-size, and the per-mesh-size namespace (fortio + deployment-count×scale-to sidecar pods) exceeded the 180s `COEXEC_NS_DELETE_TIMEOUT_SEC` at scale → `CLEANUP_TIMEOUT` → the next mesh-size's `001` applied into the `Terminating` namespace → all-combos `SETUP_FAILED`, oscillating odd/even. Fixed by a PL4 poll-until-gone wait inside `001` before apply (`--ns-wait-timeout`/`COEXEC_SETUP_NS_WAIT_SEC`), a short-grace pod fast-drain in `006` before the namespace delete (`COEXEC_CLEANUP_GRACE_SEC`), and raising the shared bound 180→240. All six reviewers APPROVEd round 1; the scale + istio lenses confirmed the cascade was genuinely closed (the 5s grace "sticks" across the namespace-GC delete and the `--wait-deletion` poll remains the authoritative endpoint-withdrawal gate). The chart-level `terminationGracePeriodSeconds` was punted to preserve churn-phase EDS-withdrawal comparability with already-collected sweeps.)
+
+## PL38 — A mesh-wide root `Sidecar` egress silently narrows the injected GATEWAYS too; exempt them or sever cross-cluster gateway routing
+
+**Why:** A root-namespace `Sidecar` (in `istio-system`) with an `egress` block and **no `workloadSelector`** is the mesh default — and "mesh" includes the **injected ingress/east-west gateways**, which are sidecar-injected pods (`inject.istio.io/templates: gateway`) living in `istio-system`. Scoping that egress to a namespace allow-list (the whole point of profile 01 / a scale baseline) therefore *also* strips the gateways' egress down to the same list, deleting the Envoy clusters they need for any destination not enumerated. In a multi-primary / multi-network mesh this breaks **cross-cluster routing through the gateways**: the ingress gateway loses the cluster for a cross-cluster verify Service (e.g. `mesh-verify-echo.mesh-verify`), and the east-west gateway loses upstreams. The trap is asymmetric with discoverySelectors reasoning — an implementer can correctly *label a namespace for discovery* and still leave it *unreachable from the gateway* because the egress allow-list is a second, independently-maintained list. The failure is silent at apply time (config renders, istiod is healthy) and only shows as "route returns no endpoints."
+
+**How to preempt:** When a baseline ships a mesh-wide root `Sidecar` with a narrowed egress, **exempt the gateways**: add a more-specific `Sidecar` with a `workloadSelector` matching each gateway's stable pod label (`istio: ingressgateway`, `istio: eastwestgateway`) **in the gateways' namespace** (`istio-system`), granting full egress (`*/*`). Sidecar selection is most-specific-wins (one Sidecar per proxy, not additive) and a `workloadSelector` Sidecar only governs pods in its own namespace, so this overrides the root Sidecar for the gateways only while sidecars keep the narrowed graph. Guard the gateway-exemption Sidecars under the SAME `enabled` toggle as the root Sidecar so the narrowing can never ship without the exemption. (Forward-looking: the exempted gateways then carry a full-mesh egress view — at large service counts watch their proxy RSS / `xds_config` and `memory.limits`, since the lever that shrinks sidecars does NOT shrink gateways.)
+
+(PL38 was added after the 20c/10k pretune-baseline cycle: round-1 istio caught that the baked profile-01 root Sidecar (no workloadSelector) narrowed the injected gateways and severed the documented cross-cluster mesh-verify path; fixed in round-2 with two `workloadSelector` `*/*` gateway-exemption Sidecars under the shared `sidecar.enabled` guard, verified by the istio lens against the gateway charts' real pod labels.)
+
+## PL39 — Chart-baked, GitOps-deployed mesh config is invisible to `HARNESS_SHA` provenance; live-query the resolved state into the preamble
+
+**Why:** PL2 records a run's provenance from the harness git tree (`HARNESS_SHA`: `git describe`, plus `-dirty.<8hex>` with uncommitted changes). That captures probe/script state — but a **mesh configuration baked into a Helm chart and deployed by GitOps (ArgoCD) is reconciled independently of the probe scripts**. So a toggleable mesh lever (here `tuningBaseline.{sidecar,discoverySelectors,telemetryFiltering,accessLogFiltering}` + the Sidecar egress graph) can be flipped via an Argo override, a `--set`, or a live edit and produce a run with an **identical `HARNESS_SHA` but a materially different mesh** — invisible in provenance, and two such runs silently non-comparable. The chart *default* is the wrong thing to record: the deployed state can diverge from it, which is exactly the case the provenance must catch.
+
+**How to preempt:** For any mesh behavior that lives outside the harness git tree (chart-baked + GitOps/operator-reconciled), record the state **live-queried from the cluster**, not chart defaults: query the actually-applied resources (the `Sidecar`/`Telemetry` CRs, `meshConfig.discoverySelectors` on the Istio CR, the live egress hosts) once per sweep, before its first window (`!DRY_RUN`-gated, bounded with `--request-timeout`), and write `unknown` on failure, never a false `off` (`unknown` means non-comparable, like `istiod_restarted`'s `0|1|unknown`). Then propagate it like any preamble key: from every writer through the shared emitters (PL36), into ALL report formats (PL19), as `mixed` with a warning when inputs disagree (PL26). Apply it to **every** suite that runs against the configured mesh, not just the primary one — a partial roll-out reintroduces the gap for the omitted suites. Read it once per sweep, not again per step or per pass.
+
+(PL39 was added after the 20c/10k pretune-baseline cycle: round-1 reproducibility caught that the `tuningBaseline.*` toggles changed measurable mesh behavior but appeared in no preamble — a GitOps override would be invisible under an unchanged `HARNESS_SHA`; round-2 added a live-queried `TUNING_BASELINE`/`SIDECAR_EGRESS_HOSTS` preamble pair, and round-3 extended it from controlplane-only to all five suites after reproducibility flagged the partial roll-out.)
+
+## PL40 — A best-effort/optional sub-step that can `die` internally is a whole-run killer under `set -e`; its `|| warn` path is dead code unless the step is subshell-isolated
+
+**Why:** An orchestrator commonly adds an *optional, best-effort* step (campaign-end scale-envelope generation, a nice-to-have artifact) guarded by `do_it 2>/dev/null || warn "skipped"`, intending "if it fails, warn and carry on — the real data is already safe." But if `do_it` is a sourced lib function (or sub-script) that calls `die` (→ `exit 1`) on its OWN error paths, under `set -euo pipefail` that `exit` propagates out and aborts the WHOLE orchestrator *before* the `|| warn` can run. So two things are simultaneously true and both invisible: (a) the `|| warn` "graceful" branch is **unreachable dead code**, and (b) a step the author believed was non-fatal silently becomes a **whole-sweep killer** at the very end of a multi-hour run. Compounding it, the `2>/dev/null` that was meant to keep the optional step quiet **hides the specific `die` reason** on exactly the path (headline-artifact generation failed) where the operator most needs a clue — they get a generic, possibly-wrong warning instead.
+
+**How to preempt:** Run any best-effort/optional sub-step that may `die` internally inside a **subshell**, and print its stderr instead of discarding it:
+```
+if ! ( run_optional_step ) 2>"$err"; then
+    warn "optional step failed (primary data is safe above):"
+    sed 's/^/  /' "$err" >&2     # surface the SPECIFIC die reason
+fi
+```
+The subshell contains the `die`'s `exit` so the orchestrator continues (the in-process twin of PL32). Only a step no report number depends on may be best-effort (the campaign scale envelope, rendered after the reports). A step whose failure would leave a number wrong or missing is not optional: it is a failed cell (PL32) or a `sweep_problem` in the sweep's outcome (exit 4), never a warning alone. Verify once by hand: point the step at a missing results dir and confirm the run continues with the reason printed.
+
+(PL40 was added after the report-hardening cycle: round-1 usability flagged that `003-run-sweep.sh` swallowed `render_scale_envelope` stderr with `2>/dev/null`; fixing it revealed the deeper bug — `render_scale_envelope` calls `die` internally, so without the subshell wrap the "best-effort" warning branch was dead code and a failed envelope render would have aborted the whole sweep after all combos completed. Fixed by subshell-isolating the render and echoing the captured stderr.)
+
+## PL41 — A "route all X through a shared knob" centralization sweep must enumerate EVERY call site, including suite-local duplicates that bypass the shared lib
+
+**Why:** When a value is centralized into one tunable (here: replacing hardcoded `curl --max-time 5` with a shared `METRICS_SCRAPE_TIMEOUT`), the obvious targets are the shared-lib helpers (`tests/lib/metrics.sh`, `preamble.sh`, `fanout.sh`). But a suite often has its OWN copy of the same operation that does not go through the lib — controlplane's **primary** TSV-feeding scrape lives in `tests/controlplane/002-collect-resource-metrics.sh` (`scrape_one_context`) with its own `curl --max-time 10`, plus a peak-poller scrape and a readiness probe with yet other ceilings. Fixing only the lib helpers leaves the suite-that-matters's hot path on the old hardcoded value, so the change ships looking complete (lib routed, `verify.sh` green, "ONE place to tune" claimed) while the exact failure it targets — an MB-class 10k `/metrics` body dropped by a too-small ceiling — is still live on the primary path. The "single lever" claim is then actively false: the tree has 4 uncoordinated ceilings.
+
+**How to preempt:** Before declaring a centralization done, **grep the whole tree for the operation, not just the lib** — e.g. `grep -rnE 'curl.*/metrics|--max-time' tests/` — and route each hit through the one knob or helper, or give it a one-line comment saying why it differs (e.g. a body-discarding `-o /dev/null` liveness probe that must fail fast). A suite-local duplicate of a shared operation in a `0NN-*.sh` is the default place this leaks. The same holds for a rule two scripts must apply alike (a sweep that counts its cells and the report that reads them): it lives in one shared function both call, never in two copies kept in step.
+
+(PL41 was added after the metrics-timeout/ns-wait calibration cycle: round-1 routed `metrics.sh`/`preamble.sh`/`fanout.sh` through the new `METRICS_SCRAPE_TIMEOUT` but the scale lens caught that controlplane's primary `scrape_one_context` body scrape (and the peak poller) still hardcoded `--max-time 10/3`, leaving the headline 10k-body-drop unfixed on the suite that feeds the campaign's resource numbers; round-2 routed both body fetches through the knob and documented the readiness probe's deliberately-short ceiling.)
+
+## PL42 — A client timeout meant to outlast an Envoy timeout must cover Istio's default retry chain, not just `connectTimeout`
+
+**Why:** The remote-reachability check sends one detail request whose purpose is to let the client sidecar's Envoy give up first and report *why* (`upstream connect error ... reset reason: connection timeout` vs `remote connection failure` vs `no healthy upstream`). Sizing that request's timeout just above meshConfig's 10 s `connectTimeout` (12 s) looks right but is not: Istio's default route policy retries `connect-failure` twice with no per-try timeout and a route timeout of 0, so Envoy only answers after about 3 × 10 s. Any shorter client timeout ends in fortio's own `-1`, and a blackholed east-west gateway becomes indistinguishable from a dropped connection — the exact distinction the detail exists to make.
+
+**How to preempt:** When a harness timeout must outlast a proxy-side timeout, compute it from the whole chain the proxy runs: `connectTimeout × (retries + 1)` plus margin, using the route's effective retry policy (default `attempts: 2`, `retryOn` including `connect-failure`), and put the arithmetic in the comment next to the knob. Keep such a long timeout off the hot path (one request, last attempt only) so a dead target does not multiply it.
+
+(PL42 was added after the 2026-10-13 backlog cycle: the validation-fix pass set `REACH_DETAIL_TIMEOUT_SEC=12`; the Istio lens caught that the default retries push Envoy's verdict to about 30 s, and round 2 set 35 s, used only on the last reach attempt.)
+
+## PL43 — A functional check's "YES, it is needed" must be the hypothesis's own failure signature, on config that was in place, seen twice, with the positive path proven
+
+**Why:** A check that answers a yes/no question from traffic (here `misc_tests/gateway-api/`: "does an HTTPRoute need a local Service/namespace?") has many ways to print a YES that is really "not ready yet" or "broken everywhere": a 404 from a route not yet pushed to the ingress, a 503 from EDS lag, a 500 that is not Envoy's empty cluster-not-found reply, a route status that appeared only after the traffic, a scenario that also fails through the member that runs the workload, a transient the retry did not repeat, or a retry that never ran. Each looks like evidence for the hypothesis, and each appeared in a review round of the same branch.
+
+**How to preempt:** Derive the exact failure signature from the source (gateway-api: an HTTPRoute whose backend is dropped answers an empty-body 500, ClusterNotFound; a classic route an empty-body 503) and classify every other outcome as unclear, never as YES. A YES also needs:
+- the config in place (status Accepted) at both the start and the end of the traffic window;
+- the same scenario answering through the positive path (the workload member), and a negative control showing the signature through the same ingress;
+- a delayed re-probe repeating the same signature (a re-probe with no record is unclear);
+- no contradiction from a sibling scenario that runs the same code path;
+- traffic gated on a readiness probe whose result does not depend on the question.
+
+A NO may accept a late success (an answer with the workload's text proves the path whenever it arrives); a YES never may.
+
+(PL43 was added after the gateway-api multicluster check cycle: rounds 2 to 5 each found another way to print a false YES — 404/503 counted as failures, a route not in place, a failure through the workload member, a re-probe that disagreed or never ran — and each was closed by narrowing what counts as `fail`.)
+
+## PL44 — Never assert an exact elapsed-seconds value in bats
+
+**Why:** A duration computed as `SECONDS - start` reads 0 or 1 depending on whether the run crossed a second boundary. `tests/lib/test/gateway-api.bats` asserted `passed after 0 s` and failed 2 of 4 full runs on a reviewer's host, in a required CI check.
+
+**How to preempt:** Match measured durations with a pattern (`[0-9]+`) or a bounded range; assert exact values only for configured knobs. Run a new bats file that checks timings at least five times in a row before calling it green.
+
+(PL44 was added after the same cycle's round-4 usability review.)
+
+## PL45 — A sweep's signal trap waits for its foreground step: run steps in the background, in a process group of their own, and stop that group
+
+**Why:** Bash runs a trap only after the foreground command returns. A `kill -TERM <sweep pid>` (a CI timeout, a scheduler, `kill` from another terminal) therefore waited for the running step, which can be a cell of an hour: the sweep did not stop, and its stop record was written only after the step's results were. Running the step in the background and `wait`ing for it lets the trap run at once, but a signal sent to the step's PID alone reaches no one else: the step's own children (in-flight kubectl, per-member `( ... ) &` workers, commands under `timeout`) ran on after the sweep exited and released its lock.
+
+**How to preempt:** Start each step through `sweep_step` (`tests/lib/common.sh`): a background job in a process group of its own (stdin `/dev/null`) that the sweep `wait`s for, so the trap runs at once; pass a script, never a function or a pipeline, and guard the call (PL32). On HUP, INT or TERM the sweep sends SIGTERM to the step's process group (the step and everything it started), then SIGKILL to what still runs `SWEEP_STOP_GRACE_SEC` later, so it never hangs; its EXIT trap records `interrupted` with the signal and prints the suite's cleanup command (`SWEEP_CLEANUP_CMD`). Keep the grace (30 s default) above every step's exit-time cleanup bound, and run bounded commands through `run_timeout`, whose `--foreground` keeps them in the step's group. One bats test proves it: a stub step that starts a child and sleeps; a SIGTERM to the sweep leaves no process of the step's group and records `interrupted`.
+
+(PL45 was added after carry-over round 2: the scale lens found in round 1 that a SIGTERM to a sweep waited for its step, as the sweeps' help said; rounds 2 to 5 forwarded the signal, then stopped the step's whole tree through `ps` and `/proc` walks and process freezes; the 2026-10 editing pass replaced all of that with the step's own process group.)
+
+## PL46 — A `! cmd` in the middle of a bats test never fails it
+
+**Why:** bats runs each test under `set -e` plus an ERR trap, and bash exempts a command negated with `!` from both, so `! grep -q '^PROBLEM=' "$rec"` in the middle of a test passes whatever grep finds; only the test's last command sets its status. The same holds in a loop (only the last pass counts), an `if` body and a `{ }` group. 52 such assertions in 15 bats files proved nothing.
+
+**How to preempt:** A convention, not a lint: write `! cmd || false` (keeps `$output` and `$status`) or `run ! cmd` (bats 1.5+; overwrites them); bats-assert's `refute`, `refute_output` and `refute_line` fail properly. The same exemption covers every command but the last of an `a && b` list, so `[ -e f ] && [ ! -s f ]` passes when `f` is missing: write two assertions. The conventions reviewer checks new tests for it.
+
+(PL46 was added after carry-over round 5: a review found the mid-test negations; once converted to `|| false` all 52 still passed, every negated grep reading a file that exists. The 19 mid-test `[ ] && [ ]` assertions found with them were split into one assertion per line, and also still pass. The lint added then was dropped in the 2026-10 editing pass; the convention stays.)
+
+## PL47 — A new deployment axis goes into every result's provenance in the same change
+
+**Why:** Making the harness run on two platforms (Kubernetes with the Sail operator, OpenShift with OSSM, on kind or cloud nodes) turned "which platform and mesh build produced this row" into a hidden variable. Round 1 of the de-Red-Hat cycle found that only the gateway-api check recorded the operator build: every other TSV and report would have averaged kind and cloud, Sail and OSSM runs without a trace.
+
+**How to preempt:** When a change adds an axis results depend on (platform, operator, node provider, mesh build), add it to the platform record (`tests/lib/platform.sh`) in that change: read live, once per member, before any measurement window; written by every TSV writer and placeholder through `platform_preamble_lines` (PL36); merged in every report, with a warning in its body when the inputs differ; and read again at a sweep's end, where a change is a problem in its outcome (exit 4). A value that cannot be read is `unknown`, never a guess.
+
+(PL47 to PL54 were added after the de-Red-Hat cycle: rounds 1 to 4.)
+
+## PL48 — A changed IaC default needs a plan-time guard against live state
+
+**Why:** Defaulting `platform` to `kubernetes` made an existing OpenShift deployment whose tfvars never set it plan as Kubernetes: the plan would have destroyed the ArgoCD CR and the ACM releases and replaced the app-of-apps, whose resources finalizer takes the mesh with it. Nothing in the diff looked dangerous.
+
+**How to preempt:** When a new default changes what a root manages, read the live system at plan time (a data source with a postcondition) and fail before any change when it disagrees, naming the setting that fixes it. Keep an unreadable target a warning, so `terraform destroy` and plans with nothing to do there still work.
+
+## PL49 — Never delete the object a generator selects from while re-registering
+
+**Why:** The ApplicationSets generate a member's Applications from its Argo CD cluster Secret, and the Applications carry the resources finalizer. A re-registration that deletes and recreates the Secret (the obvious way to rotate a token or move a ServiceAccount) deletes every Application of that member, and with them its mesh.
+
+**How to preempt:** Update registration objects in place; put destroy-time cleanup in a separate resource that only runs on destroy. Prove a re-registration on a lab by comparing every Application's creationTimestamp before and after.
+
+## PL50 — Freeze the files Terraform reads between plan and apply
+
+**Why:** Editing a chart or values file that Terraform reads (`file()`, chart checksums, `charts/argocd-config/values.yaml`) after `terraform plan -out` failed the apply with "inconsistent result" and dropped a resource from state. Re-planning fixed it, but an apply that half-succeeds against a shared hub is how drift starts.
+
+**How to preempt:** Don't edit files under `charts/` or `terraform/` while a saved plan is pending; when you must, re-plan and read the new plan before applying.
+
+## PL51 — Run CI's exact lint invocation before pushing
+
+**Why:** `tests/lib/verify.sh` ran shellcheck one file at a time, while CI runs one shellcheck over every file, which follows `source` of files on the same command line. A library's array locals then shared names with scalars in four report scripts (SC2178/SC2128): green locally, red in both required jobs.
+
+**How to preempt:** Copy CI's command (`find tests/ terraform/ -name '*.sh' ... | xargs shellcheck --shell=bash`) and run it as is before every push that touches shell. Prefix library locals and globals (`_pl_*`, `PLATFORM_*`) so they cannot collide with a caller.
+
+## PL52 — A check through a load-balanced Service samples one replica; check every endpoint
+
+**Why:** The wiring gate read istiod's `/metrics` through `istiod.istio-system.svc`, so each probe saw one of three replicas. Each replica connects to every peer API server itself, so one replica that cannot reach a peer leaves a third of the proxies without that member's endpoints, while the gate fails one probe in three and stays Ready.
+
+**How to preempt:** When a readiness check reads per-replica state (sync status, caches, connections), list the Service's Ready endpoints and check each one, naming the replica that fails. Only state that every replica derives from the same input (a parsed Secret count) is safe to sample.
+
+## PL53 — A completion check waits for what will be rendered, not for the first object per target
+
+**Why:** The apply's status check waited until every mesh member had an Application with a status. The gate's ApplicationSet, which Terraform creates with the cluster Secrets, satisfied that at once: on a greenfield kind apply the check passed after 11 s with 3 Applications, and 30 more came 7 minutes later (about 200 at 20 members) unchecked.
+
+**How to preempt:** Derive what to wait for from what the system declares it will create (each Application's `status.resources`, each ApplicationSet's generator) and count every expected child per parent; a test with only the first parent's children present must keep waiting.
+
+## PL54 — Sharding that re-indexes on every membership change must evict what a replica stops owning
+
+**Why:** Argo CD 3.5.3's round-robin sharding re-sorts every cluster on each cluster Add or Delete, but a controller drops a cluster's cache only on a Mod or Delete of that cluster's own Secret. With fixed replicas and Secrets arriving one by one, replicas kept full list/watch caches of members they no longer owned: about 13 stale caches after a simulated 20-spoke apply, the busiest controller caching 6-8 members where it owns 3. Round-robin itself was round 1's fix for consistent hashing, so the fix of a fix needed its own review.
+
+**How to preempt:** When an assignment depends on the whole membership, check what each owner does with state it stops owning, in the source. Pin the assignment where the owner can only evict on its own object's change (a `shard` in each cluster Secret, index in name order + 1 mod replicas), and verify per replica from its own metrics (`argocd_cluster_info` on :8082) that it holds only what it owns.
+
+## PL55 — A value that grows with the fleet never rides the arguments or the environment
+
+Retired (2026-10 editing pass): written for a fleet of 400 to 500 members, where the campaign has 20. Still true: Linux refuses to start a command whose single argument or environment string exceeds 128 KiB.
+
+## PL56 — A message about a fleet names what differs, five at most, with a count
+
+Retired (2026-10 editing pass): its five-member caps are not needed at the campaign's 20 members. Still holds: a warning names what differs (the members and both values), not every member's value.
+
+(PL55 and PL56 were added after the same cycle's round 5.)
+
+## PL57 — A change made only through a patch leaves nothing to find; put a labelled marker on first and take it off last
+
+Retired (2026-10 editing pass): it made a labelled marker the rule for every in-place change, more than the campaign needs. Still holds: a tuning run killed before its revert leaves its profile applied, and `tests/tuning/005-cleanup.sh` must undo it before the next sweep.
+
+## PL58 — A check that a run held nothing foreign also checks that it held all of its own
+
+Retired (2026-10 editing pass): the tuning-objects record key it compared in both directions is gone.
+
+## PL59 — A cleanup that cannot see a record says what it did not check
+
+Retired (2026-10 editing pass): finding another checkout's records by value is more than the campaign needs. Still holds: a cleanup that skipped a part names that part and the command that does it, instead of an unqualified "complete".
+
+(PL57 to PL59 were added after the same cycle's round 6.)
+
+## PL60 — A check moved from the run to each of its parts needs a reader in each part's report
+
+Retired (2026-10 editing pass): the per-pass drift file it gave a reader is gone.
+
+## PL61 — A value that was not read is not known, never another value; one that holds two values is mixed
+
+**Why:** Tuning 004 compared each member's istiod settings with the baseline's, so a member whose istiod could not be read (`unknown`) read as other settings, and a pass whose TSVs disagree on a build read as another build than the baseline's: a profile could be credited with, or blamed for, a difference nobody had seen.
+
+**How to preempt:** An unread value (`unknown`, `unreachable`, a digest `@unknown`) is not a value: a comparison with it is not known (say so, naming the members), never `same` or `differs`, and never filled with a default. A merge of inputs that disagree reads `mixed:<a>,<b>` and warns (PL26). One test per rule.
+
+(PL60 and PL61 were added after the same cycle's round 7.)
+
+## PL62 — A read moved into each part makes each part its own reference; compare the parts with each other
+
+Retired (2026-10 editing pass): the per-pass reads and comparisons of tuning levers, istiod limits and replica counts are gone.
+
+(PL62 was added after the same cycle's round 8.)
+
+## PL63 — A capped list of a fleet names the members that matter most first
+
+Retired (2026-10 editing pass): capped, ranked member lists are not needed at the campaign's 20 members.
+
+(PL63 was added after the same cycle's round 14.)
+
+## PL64 — Guard the number, not the bookkeeping
+
+**Why:** Each review round of PRs #107 and #109 turned a theoretical gap into a check, a state and tests, until the checks of checks outweighed the measurements (1,331 tests, 62-minute CI) and the harness grew too large to operate without AI.
+
+**How to preempt:** Name the wrong or mislabeled number a check prevents before writing it; prefer failing loudly (stop the run, or a problem in its outcome) over recording one more state; one rule, one test; when a check needs a check, delete the first one or make it simpler.
+
+(PL64 was added by the 2026-10 editing pass, PR #110, which retired PL55 to PL60, PL62 and PL63; reviews now apply the substantive rule in [README](README.md).)
+
+## PL65 — A wait polls the rule its check applies; a terminating pod has ended
+
+**Why:** The Istio version check waited with `kubectl wait --for=condition=Ready` on the Istio CR, which Sail sets while istiod's old pods are still terminating: the wait returned at once, the check that followed found the member not ready and stopped the run, which said it had waited 60 s. The platform record had the mirror fault: its image and env reads counted terminating pods, so the tail of a rollout read as a second image and a drift problem in the sweep's outcome.
+
+**How to preempt:** Re-read and re-apply the check's own rule until it holds or one deadline passes, never a condition of another object that seems to mean the same. A read of what a workload runs leaves out pods with a `deletionTimestamp`.
+
+## PL66 — A command a run prints for later works from the state its exit leaves
+
+**Why:** Tuning 003's `clean up with:` line began with `006-gitops-pause.sh --resume --state-file`, but the sweep's EXIT trap had already resumed Argo CD and deleted that record, so the first command of the pasted line exited 1.
+
+**How to preempt:** Print only commands that are safe to run after the trap ran (they find what is left, or nothing to do), and test the line against what a stopped sweep leaves.
+
+(PL65 and PL66 were added after rounds 1 and 2 of the editing pass's review.)

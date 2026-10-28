@@ -1,0 +1,30 @@
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: {{ .Values.placement.name }}
+  namespace: {{ .Values.gitopsNamespace }}
+spec:
+  # Required on current RHACM/OCM controllers: otherwise status reports NoManagedClusterSetBindings / no valid bindings.
+  clusterSets:
+    - {{ .Values.clusterSet | quote }}
+  tolerations:
+    - key: cluster.open-cluster-management.io/unreachable
+      operator: Exists
+    - key: cluster.open-cluster-management.io/unavailable
+      operator: Exists
+  {{- if or .Values.placement.excludeHubLocalClusterLabel (.Values.placement.requireMeshMemberLabel | default false) }}
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            {{- if .Values.placement.excludeHubLocalClusterLabel }}
+            - key: local-cluster
+              operator: DoesNotExist
+            {{- end }}
+            {{- if .Values.placement.requireMeshMemberLabel | default false }}
+            - key: istio-mesh-member
+              operator: In
+              values:
+                - "true"
+            {{- end }}
+  {{- end }}

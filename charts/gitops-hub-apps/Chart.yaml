@@ -1,0 +1,5 @@
+apiVersion: v2
+name: gitops-hub-apps
+description: Child Argo CD Applications of the hub app-of-apps (hub-gitops-root).
+type: application
+version: 0.2.0

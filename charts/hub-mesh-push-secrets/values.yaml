@@ -1,0 +1,66 @@
+# ESO operand namespace on the hub (SecretStores, ExternalSecret, PushSecrets).
+namespace: external-secrets-operator
+# Hub namespace holding the intermediate CA Secrets (charts/hub-mesh-ca-intermediate).
+sourceSecretsNamespace: cert-manager
+# Namespace the Secrets are pushed to on each spoke.
+spokeTargetNamespace: istio-system
+
+# Set per cluster by the ApplicationSet.
+clusterName: ""
+clusterServer: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Istio cacerts built from mesh-intermediate-<clusterName>-material, pushed to this spoke.
+cacerts:
+  enabled: true
+  sourceSecretName: ""
+  targetSecretName: ""
+  refreshInterval: 5m
+
+# Istio remote secret istio-remote-secret-<clusterName>, pushed to every mesh member.
+# The hub Secret kubeconfig-<clusterName> (charts/hub-kubeconfig-from-argosecret) is
+# its source and also authenticates the spoke SecretStore.
+kubeconfig:
+  enabled: true
+  sourceSecretName: ""
+  # Kept short: ESO reports a PushSecret Synced even when only some target stores
+  # received it, so this bounds how long a missed member stays unwired.
+  # charts/mesh-wiring-verify reports missing remote secrets.
+  refreshInterval: 5m
+
+kubernetesAPI:
+  serverURL: ""
+  caFromConfigMap:
+    enabled: true
+    name: kube-root-ca.crt
+    key: ca.crt
+
+secretStoreName: ""
+serviceAccountName: ""
+
+spokeSecretStore:
+  enabled: true
+  name: ""
+  skipCAProvider: false
+  authType: token
+  labels:
+    hub-mesh-push-secrets/push-target: "true"
+
+pushSecret:
+  refreshInterval: 5m
+
+rbac:
+  enabled: true
+  argocd:
+    namespace: argocd
+    serviceAccountName: argocd-application-controller
+
+argoSyncWaves:
+  enabled: true
+  rbac: -30
+  secretStore: -25
+  externalSecret: 0
+  spokeSecretStore: 5
+  pushSecret: 10

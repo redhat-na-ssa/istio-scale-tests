@@ -1,0 +1,57 @@
+# Required. Set per cluster by the ApplicationSet; the network is "<clusterName>-<networkSuffix>".
+clusterName: ""
+networkSuffix: network
+
+# Used when autoscaling.enabled=false. Fixed so the gateway does not scale mid-test.
+# A PodDisruptionBudget is rendered only with more than one replica.
+replicaCount: 1
+
+# Sized for the 20-cluster / 10k-Service campaign. Envoy here allocates about 145 Mi per
+# 1000 discovered Services (2 clusters per Service, mesh-wide; ROSA 2026-10-14), and after
+# config bursts its working set ran 1.2-2.9x that (tcmalloc keeps freed pages): 10k
+# Services is about 1.45 GiB allocated and up to about 4 GiB working set. The 1Gi limit
+# capped the mesh near 5000 Services. Sizing rule: limit >= (10 Mi + 145 Mi x Services /
+# 1000) x 2.5; the request reserves the steady state. See docs/scale-test-campaign.
+# 5Gi, above the rule's 3.6 GiB at 10k: a one-step 0 -> 10k burst peaked at 3.4 GiB (85% of
+# the earlier 4Gi; ROSA 2026-10-16), and a second burst can keep 2.6-2.9x allocated.
+resources:
+  requests:
+    cpu: 100m
+    memory: 1Gi
+  limits:
+    cpu: 2000m
+    memory: 5Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+service:
+  # Must be reachable from every other mesh member; see README.md.
+  type: LoadBalancer
+  # With MetalLB and a pool set to autoAssign: false: {metallb.io/address-pool: <pool>}
+  annotations: {}
+  nodePorts:
+    # Fixed nodePort for 15443. Used directly with type NodePort; also allocated
+    # (and harmless) with type LoadBalancer.
+    tls: "31443"
+
+# The proxy image comes from istiod's injection (pinned by the Istio version). With
+# image: auto alone Kubernetes would default the policy to Always and pull on every start.
+imagePullPolicy: IfNotPresent
+
+# PreSync Job that waits for istiod before the gateway syncs.
+waitForIstiod:
+  # Same curl image as charts/spoke-ingress-gateway waitForIstiod.image, charts/spoke-ossm
+  # waitForCacerts and charts/mesh-wiring-verify (this chart's README.md repeats the tag).
+  image: docker.io/curlimages/curl:8.22.0
+  # The image's user (curl_user) is not numeric, so runAsNonRoot needs the UID.
+  # values-openshift.yaml clears it: OpenShift assigns one from the namespace range.
+  runAsUser: 100
+
+argoSyncWaves:
+  enabled: true
+  gateway: "0"
+  exposeServices: "5"

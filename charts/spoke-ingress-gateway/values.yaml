@@ -1,0 +1,52 @@
+# Required. Set per cluster by the ApplicationSet; the network is "<clusterName>-<networkSuffix>".
+clusterName: ""
+networkSuffix: network
+
+# Used when autoscaling.enabled=false. Fixed so the gateway does not scale mid-test.
+# A PodDisruptionBudget is rendered only with more than one replica.
+replicaCount: 1
+
+# Sized for the 20-cluster / 10k-Service campaign: Envoy here allocates about 91 Mi per
+# 1000 discovered Services (1 cluster per Service; ROSA 2026-10-14) and its working set
+# tracked that (x1.15, no burst retention), so 10k Services is about 1.1 GiB. Sizing
+# rule: limit >= (10 Mi + 91 Mi x Services / 1000) x 1.5.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+service:
+  # LoadBalancer needs an LB provider (a cloud LB or MetalLB). A MetalLB pool with
+  # autoAssign: false serves only Services that request it by annotation:
+  #   annotations: {metallb.io/address-pool: <pool>}
+  # On AWS use an NLB ({service.beta.kubernetes.io/aws-load-balancer-type: nlb}): behind a
+  # Classic LB the gateway saw each HTTP request followed by a FIN and aborted it
+  # (ROSA 2026-10-14). terraform/platform sets it in rosa mode (rosa_ingress_nlb).
+  type: LoadBalancer
+  annotations: {}
+
+# The proxy image comes from istiod's injection (pinned by the Istio version). With
+# image: auto alone Kubernetes would default the policy to Always and pull on every start.
+imagePullPolicy: IfNotPresent
+
+# PreSync Job that waits for istiod before the gateway syncs.
+waitForIstiod:
+  # Same curl image as charts/spoke-east-west-gateway waitForIstiod.image, charts/spoke-ossm
+  # waitForCacerts and charts/mesh-wiring-verify.
+  image: docker.io/curlimages/curl:8.22.0
+  # The image's user (curl_user) is not numeric, so runAsNonRoot needs the UID.
+  # values-openshift.yaml clears it: OpenShift assigns one from the namespace range.
+  runAsUser: 100
+
+argoSyncWaves:
+  enabled: true
+  gateway: "0"

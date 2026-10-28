@@ -1,0 +1,28 @@
+# Preset: mesh-verify echo workload on every mesh member (charts/mesh-verify-appset.yaml).
+identity:
+  component: mesh-verify
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-mesh-verify
+  roleBindingName: openshift-gitops-ocm-placement-mesh-verify
+
+argocdApplicationControllerRbac:
+  roleName: gitops-mesh-verify-appset-argocd-sync
+  roleBindingName: gitops-mesh-verify-appset-argocd-sync
+
+applicationSet:
+  name: mesh-verify
+
+destination:
+  mode: clusterName
+  namespace: mesh-verify
+
+template:
+  applicationNameSuffix: mesh-verify
+  source:
+    path: charts/mesh-verify
+    helm:
+      releaseName: mesh-verify
+      parameters:
+        - name: clusterName
+          value: "{{clusterName}}"

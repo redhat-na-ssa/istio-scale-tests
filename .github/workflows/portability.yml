@@ -1,0 +1,323 @@
+name: Cross-platform script validation
+
+# No `paths:` filter: `validate (ubuntu-latest)` and `validate (macos-latest)` are
+# required checks on `main`, so the job must always report a status. The "Detect
+# relevant changes" step decides whether the work steps run on a pull request;
+# doc-only PRs pass in seconds. A push to main, the weekly run and a manual run
+# ("Run workflow") check everything, so drift (a moved image, a runner or tool
+# change) shows up without waiting for the next PR.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # need base + head to diff changed paths
+          submodules: ${{ runner.os == 'Linux' }}  # bats-core/-assert/-support (bats runs on Linux only)
+
+      - name: Detect relevant changes
+        id: changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "Event ${EVENT}: checking everything."
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "Changed files:"
+          echo "$changed"
+          # `case` globs are not path-aware: '*' also matches '/'.
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              tests/*.sh|misc_tests/*|tests/*.bats|tests/*.py|tests/lib/test/*|tests/*/chart/*|tests/*/configs/*|tests/tuning/profiles/*|tests/campaign/profiles/*|charts/*|terraform/*.sh|terraform/*.tf|terraform/*.hcl|config/*.env|.gitmodules|.shellcheckrc|.github/workflows/portability.yml)
+                relevant=true ;;
+            esac
+          done <<< "$changed"
+          echo "relevant=$relevant"
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          if [ "$relevant" = "false" ]; then
+            echo "::notice::No script/config changes detected — skipping validation, reporting success."
+          fi
+
+      - name: Install Bash 4+ (macOS)
+        if: runner.os == 'macOS' && steps.changes.outputs.relevant == 'true'
+        run: |
+          brew install bash kubectl helm shellcheck
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+
+      - name: Install Helm (Linux)
+        if: runner.os == 'Linux' && steps.changes.outputs.relevant == 'true'
+        uses: azure/setup-helm@v5
+        with:
+          version: v4.2.2
+
+      - name: Install Terraform (Linux)
+        if: runner.os == 'Linux' && steps.changes.outputs.relevant == 'true'
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.7
+          terraform_wrapper: false
+
+      - name: Show tool versions
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          echo "bash: $(bash --version | head -1)"
+          echo "date: $(date --version 2>&1 | head -1 || echo 'BSD date (no --version)')"
+          echo "kubectl: $(kubectl version --client -o json 2>/dev/null | jq -r '.clientVersion.gitVersion' 2>/dev/null || echo 'not installed')"
+          echo "helm: $(helm version --short 2>/dev/null || echo 'not installed')"
+          echo "terraform: $(terraform version 2>/dev/null | head -1 || echo 'not installed')"
+
+      - name: Syntax check (bash -n)
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          status=0
+          while IFS= read -r f; do
+            if ! bash -n "$f" 2>&1; then
+              echo "FAIL: $f"
+              status=1
+            fi
+          done < <(find tests/ misc_tests/ terraform/ -name '*.sh' -type f -not -path '*/.terraform/*' -not -path 'tests/lib/test/bats-*')
+          exit $status
+
+      - name: shellcheck
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          find tests/ misc_tests/ terraform/ -name '*.sh' -type f -not -path '*/.terraform/*' -not -path 'tests/lib/test/bats-*' | sort \
+            | xargs shellcheck --shell=bash
+
+      - name: '--help smoke test'
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          status=0
+          while IFS= read -r f; do
+            if grep -q '\-\-help' "$f"; then
+              echo "--- $f --help ---"
+              if ! bash "$f" --help >/dev/null 2>&1; then
+                echo "FAIL: $f --help exited non-zero"
+                status=1
+              fi
+            fi
+          done < <(find tests/ misc_tests/ terraform/ -name '0*.sh' -type f -not -path '*/.terraform/*' -not -path 'tests/lib/test/bats-*' | sort)
+          exit $status
+
+      - name: '--dry-run smoke test'
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          status=0
+          # Discover scripts annotated with "# ci-dry-run: [extra-args]".
+          # New scripts opt in by adding that comment before `set -euo pipefail`.
+          while IFS= read -r f; do
+            args=$(grep -m1 '^# ci-dry-run:' "$f" | sed 's/^# ci-dry-run://')
+            echo "--- $f --dry-run ${args:-(no extra args)} ---"
+            # Word-split $args intentionally — each token is a separate CLI arg.
+            # shellcheck disable=SC2086
+            if ! bash "$f" --dry-run $args 2>&1; then
+              echo "FAIL: $f --dry-run exited non-zero"
+              status=1
+            fi
+          done < <(grep -rl --exclude-dir=.terraform --exclude-dir='bats-*' '^# ci-dry-run:' tests/ misc_tests/ terraform/ --include='*.sh' | sort)
+          exit $status
+
+      - name: Dry-run annotation enforcement
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          status=0
+          while IFS= read -r f; do
+            if ! grep -q '^# ci-dry-run:\|^# ci-dry-run-skip:' "$f"; then
+              echo "FAIL: $f mentions --dry-run but has no ci-dry-run annotation"
+              status=1
+            fi
+          done < <(grep -rl --exclude-dir=.terraform --exclude-dir='bats-*' '\-\-dry-run' tests/ misc_tests/ terraform/ --include='0*.sh' | sort)
+          if ((status == 0)); then echo "PASS — all --dry-run scripts are annotated"; fi
+          exit $status
+
+      - name: Portable timestamp helpers
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          set -euo pipefail
+          die() { echo "error: $*" >&2; exit 1; }
+          source tests/lib/timestamp.sh
+          ns=$(now_ns); ms=$(now_ms)
+          echo "now_ns=$ns  now_ms=$ms"
+          [[ "$ns" =~ ^[0-9]+$ ]] || { echo "FAIL: now_ns not numeric"; exit 1; }
+          [[ "$ms" =~ ^[0-9]+$ ]] || { echo "FAIL: now_ms not numeric"; exit 1; }
+          (( ${#ns} >= 19 )) || { echo "FAIL: now_ns too short (${#ns} digits)"; exit 1; }
+          (( ${#ms} >= 13 )) || { echo "FAIL: now_ms too short (${#ms} digits)"; exit 1; }
+          echo "PASS"
+
+      - name: Portable base64 (no -w flag)
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          encoded=$(echo -n "hello world" | base64 | tr -d '\n')
+          echo "encoded=$encoded"
+          [[ "$encoded" == *$'\n'* ]] && { echo "FAIL: newline in output"; exit 1; }
+          decoded=$(echo "$encoded" | base64 -d 2>/dev/null || echo "$encoded" | base64 -D 2>/dev/null)
+          [[ "$decoded" == "hello world" ]] || { echo "FAIL: round-trip mismatch"; exit 1; }
+          echo "PASS"
+
+      # The reports search a --results-dir that can be a symlink (latest -> sweep-X) with
+      # `find -H`, and tests/lib/common.sh stops reading a TSV at its header with awk's
+      # `nextfile`; bats runs on Linux only, so check both on BSD find and awk here too.
+      - name: Portable find -H and awk nextfile
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          d="$(mktemp -d)"
+          mkdir "$d/sweep-x"
+          printf 'a\nb\n' > "$d/sweep-x/x.tsv"
+          ln -s sweep-x "$d/latest"
+          n="$(find -H "$d/latest" -name 'x.tsv' -type f | wc -l | tr -d ' ')"
+          [ "$n" = 1 ] || { echo "FAIL: find -H found $n files through a symlinked dir, not 1"; exit 1; }
+          out="$(find -H "$d/latest" -name 'x.tsv' -type f -exec awk '{ print; nextfile }' {} +)"
+          [ "$out" = a ] || { echo "FAIL: awk nextfile printed '$out', not 'a'"; exit 1; }
+          echo "PASS"
+
+      - name: No incompatible patterns outside helpers
+        if: steps.changes.outputs.relevant == 'true'
+        run: |
+          status=0
+          scan() { grep -rn --exclude-dir=.terraform --exclude-dir='bats-*' "$1" tests/ misc_tests/ terraform/ --include='*.sh'; }
+
+          echo "--- Checking for raw date +%s%N outside detection code ---"
+          if scan 'date +%s%N\|date +%s%3N' \
+              | grep -v '_detect_now_\|NOW_NS_IMPL\|NOW_MS_IMPL\|now_ns\|now_ms\|gdate' \
+              | grep -v ':[0-9]*:[[:space:]]*#'; then
+            echo "FAIL: found raw date %N usage outside portable helpers"
+            status=1
+          else
+            echo "PASS"
+          fi
+
+          echo "--- Checking for mktemp -p ---"
+          if scan 'mktemp -p ' | grep -v ':[0-9]*:[[:space:]]*#'; then
+            echo "FAIL: found mktemp -p (GNU-only)"
+            status=1
+          else
+            echo "PASS"
+          fi
+
+          echo "--- Checking for base64 -w ---"
+          if scan 'base64 -w' | grep -v ':[0-9]*:[[:space:]]*#'; then
+            echo "FAIL: found base64 -w (GNU-only)"
+            status=1
+          else
+            echo "PASS"
+          fi
+
+          echo "--- Checking for sed -i (GNU vs BSD incompatibility) ---"
+          if scan "sed -i " | grep -v ':[0-9]*:[[:space:]]*#'; then
+            echo "FAIL: found sed -i (use sed -i '' on BSD or avoid in-place)"
+            status=1
+          else
+            echo "PASS"
+          fi
+
+          echo "--- Checking for readlink -f (GNU-only) ---"
+          if scan 'readlink -f' | grep -v ':[0-9]*:[[:space:]]*#'; then
+            echo "FAIL: found readlink -f (use realpath or cd/pwd instead)"
+            status=1
+          else
+            echo "PASS"
+          fi
+
+          echo "--- Checking for grep -P (GNU-only Perl regex) ---"
+          if scan 'grep -[a-zA-Z]*P' | grep -v ':[0-9]*:[[:space:]]*#'; then
+            echo "FAIL: found grep -P (use grep -E for extended regex)"
+            status=1
+          else
+            echo "PASS"
+          fi
+
+          echo "--- Checking for gawk-only asorti() ---"
+          if scan 'asorti(' | grep -v ':[0-9]*:[[:space:]]*#'; then
+            echo "FAIL: found asorti() (gawk-only; use portable insertion sort)"
+            status=1
+          else
+            echo "PASS"
+          fi
+
+          exit $status
+
+      # python3 + PyYAML on PATH for the rest of the job: the tuning profiles below and the
+      # bats that parse report frontmatter (they skip without it, so CI must provide it).
+      # GNU parallel lets the gate run the bats files four at a time (verify.sh --jobs).
+      - name: Install python3 + PyYAML (Linux)
+        if: runner.os == 'Linux' && steps.changes.outputs.relevant == 'true'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/py"
+          "$RUNNER_TEMP/py/bin/pip" install --quiet pyyaml
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+          if ! command -v parallel >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends parallel \
+              || echo "::warning::GNU parallel did not install: the gate runs the bats files one at a time"
+          fi
+
+      - name: Shared lib gate (inline audit, bats, lints)
+        if: runner.os == 'Linux' && steps.changes.outputs.relevant == 'true'
+        run: tests/lib/verify.sh --skip-shellcheck --skip-dry-run --jobs 4
+
+      - name: helm lint
+        if: runner.os == 'Linux' && steps.changes.outputs.relevant == 'true'
+        run: |
+          status=0
+          for c in charts/*/ tests/*/chart/; do
+            [ -f "${c}Chart.yaml" ] || continue
+            helm lint "$c" || status=1
+          done
+          exit $status
+
+      # `helm lint` renders each chart with its defaults only. Argo CD renders the ApplicationSet
+      # chart with one preset per component and the app-of-apps with the repo values, so render
+      # those the same way: a broken preset otherwise fails only on a live hub.
+      - name: helm template (ApplicationSet presets, app-of-apps)
+        if: runner.os == 'Linux' && steps.changes.outputs.relevant == 'true'
+        run: |
+          status=0
+          repo=(--set repo.url=https://example.invalid/istio-scale-tests.git --set repo.revision=main)
+          for v in charts/gitops-hub-ocm-placement-appset/values-*.yaml; do
+            echo "--- $v ---"
+            helm template preset charts/gitops-hub-ocm-placement-appset -f "$v" "${repo[@]}" >/dev/null || status=1
+          done
+          for c in charts/gitops-hub-app-of-apps charts/gitops-hub-apps; do
+            echo "--- $c ---"
+            helm template root "$c" "${repo[@]}" >/dev/null || status=1
+          done
+          exit $status
+
+      - name: Tuning profiles (python3 + PyYAML)
+        if: runner.os == 'Linux' && steps.changes.outputs.relevant == 'true'
+        run: |
+          "$RUNNER_TEMP/py/bin/python" -m py_compile tests/tuning/lib/tuning.py
+          for p in tests/tuning/profiles/*.yaml; do
+            out="$(mktemp -d)"
+            "$RUNNER_TEMP/py/bin/python" -I tests/tuning/lib/tuning.py load "$p" "$out"
+            echo "ok: $p: $(cat "$out/description")"
+          done
+
+      - name: terraform fmt / validate
+        if: runner.os == 'Linux' && steps.changes.outputs.relevant == 'true'
+        run: |
+          terraform fmt -check -recursive terraform/
+          for root in terraform/platform terraform/rosa-hcp; do
+            echo "--- $root ---"
+            terraform -chdir="$root" init -backend=false -input=false -no-color
+            terraform -chdir="$root" validate -no-color
+          done

@@ -1,0 +1,261 @@
+#!/usr/bin/env bats
+# churn-dataplane 005 through its real entrypoint: each average has its own count (an
+# N/A p50 or QPS is not a 0), JSON numbers are numbers (null for N/A), the convergence p99 is
+# the worst bucket (bare range labels, "(ms)" in the header) with an overflow count instead of
+# the bucket of a mean; the platform record and the sweep outcome reach every format, and two
+# runs in one dir are refused with commands that separate them. The platform record's merge
+# and warnings are platform.bats'.
+
+load test_helper
+bats_require_minimum_version 1.5.0  # run --separate-stderr
+
+REPORT="${ROOT}/tests/churn-dataplane/005-report-results.sh"
+HDR=$'run_id\tharness_sha\tcombo_id\tmesh_size\tchurn_rate\tphase\tduration_s\tqps_target\tqps_actual\tp50_ms\tp90_ms\tp99_ms\tp999_ms\tmax_ms\tdelta_p99_ms\tistiod_restarted\tstatus\tchurn_ops_attempted\tchurn_ops_succeeded\txds_pushes_delta\teds_pushes_delta\tpush_triggers_delta\tconvergence_p99_ms\tqueue_time_p99_ms\tpush_time_p99_ms'
+
+setup() {
+	RES="${BATS_TEST_TMPDIR}/res"
+	mkdir -p "$RES"
+}
+
+# crow <combo> <churn_rate> <phase> <qps_actual> <p50> <p99> <status> <eds> <conv_p99>
+# A mesh_size=2 row; p90/p999/max and the other counters are fixed.
+crow() {
+	printf 'r1\tsha\t%s\t2\t%s\t%s\t60\t50\t%s\t%s\t3\t%s\t6\t7\tN/A\t0\t%s\t10\t10\t100\t%s\t5\t%s\tN/A\tN/A\n' "$@"
+}
+
+# write_tsv <file>; rows come on stdin. NO_PLATFORM=1: a legacy file, without the platform
+# record every writer adds now.
+write_tsv() {
+	{
+		echo "# RUN_ID=r1"
+		[[ -n "${NO_PLATFORM:-}" ]] || platform_fixture_lines
+		echo "$HDR"
+		cat
+	} > "$1"
+}
+
+# Two valid pairs at churn rate 1: c2's baseline p50 and QPS and its churn p50 are N/A.
+two_pairs() {
+	write_tsv "${RES}/churn-dataplane-r1.tsv" <<-EOF
+	$(crow c1 0 baseline 50 2 5 OK N/A N/A)
+	$(crow c1 1 churn 48 4 9 OK 30 99)
+	$(crow c2 0 baseline N/A N/A 5 OK N/A N/A)
+	$(crow c2 1 churn 46 N/A 11 OK 50 600)
+	EOF
+}
+
+@test "005: an N/A p50 or QPS is left out of its own average, not averaged as 0, and is N/A when no valid pair has one" {
+	two_pairs
+	run "$REPORT" --results-dir "$RES" --format csv
+	assert_success
+	# delta 5.00 | stdev | total | valid | bl p99 | ch p99 | bl p50 2 (not 1) | ch p50 4 (not 2)
+	# | bl qps 50 (not 25) | ch qps 47 | eds | worst conv | overflow runs
+	assert_line "2,1,5.00,1.41,2,2,5.00,10.00,2.00,4.00,50.0,47.0,40,500-1000,0"
+	run "$REPORT" --results-dir "$RES" --format md
+	assert_output --partial "| 2 | 1 | 5.00 | 1.41 | 2 | 2 | 5.00 | 10.00 | 2.00 | 4.00 | 50.0 | 47.0 | 40 | 500-1000 |"
+	write_tsv "${RES}/churn-dataplane-r1.tsv" <<-EOF
+	$(crow c1 0 baseline N/A N/A 5 OK N/A N/A)
+	$(crow c1 1 churn N/A N/A 9 OK N/A N/A)
+	EOF
+	run "$REPORT" --results-dir "$RES" --format csv
+	assert_success
+	assert_line "2,1,4.00,N/A,1,1,5.00,9.00,N/A,N/A,N/A,N/A,N/A,N/A,0"
+}
+
+@test "005: the convergence p99 is the worst bucket, with bare labels and (ms) in the header, or overflow with a count" {
+	two_pairs
+	run "$REPORT" --results-dir "$RES" --format md
+	assert_success
+	assert_output --partial "| churn_eds_pushes | churn_convergence_p99 worst (ms) |"
+	# 99 and 600 average to ~350 ("100-500"), a bucket no run hit.
+	refute_output --partial "| 100-500 |"
+	refute_output --regexp '[0-9]ms \|'
+	run "$REPORT" --results-dir "$RES"
+	assert_output --partial "churn_convergence_p99 worst (ms)"
+	assert_output --regexp '\| +500-1000'
+	run "$REPORT" --results-dir "$RES" --format csv
+	assert_line --partial ",churn_eds_pushes,churn_convergence_p99_worst,churn_convergence_overflow_runs"
+	write_tsv "${RES}/churn-dataplane-r1.tsv" <<-EOF
+	$(crow c1 0 baseline 50 2 5 OK N/A N/A)
+	$(crow c1 1 churn 48 4 9 OK 30 99)
+	$(crow c2 0 baseline 50 2 5 OK N/A N/A)
+	$(crow c2 1 churn 48 4 9 OK 30 overflow)
+	EOF
+	run "$REPORT" --results-dir "$RES" --format md
+	assert_success
+	assert_output --partial "| 30 | overflow (1 run) |"
+	run "$REPORT" --results-dir "$RES" --format csv
+	assert_line --partial ",30,overflow,1"
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format json
+	[ "$(jq -c '.rows[0] | [.churn_convergence_p99_worst, .churn_convergence_overflow_runs]' <<<"$output")" = '["overflow",1]' ]
+}
+
+@test "005: json row values are numbers, N/A is null" {
+	two_pairs
+	# A churn rate whose only pair failed: every average is N/A.
+	crow c3 0 baseline 50 2 5 OK N/A N/A >> "${RES}/churn-dataplane-r1.tsv"
+	crow c3 5 churn N/A N/A N/A FAILED N/A N/A >> "${RES}/churn-dataplane-r1.tsv"
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format json
+	assert_success
+	# Compared as numbers: jq versions print 5.00 as 5 or 5.00.
+	[ "$(jq '.rows[0] | .delta_p99_ms == 5 and .stdev_delta_p99 == 1.41 and .baseline_p50_ms == 2 and .baseline_qps == 50 and .churn_eds_pushes == 40' <<<"$output")" = true ]
+	[ "$(jq -r '[.rows[0][] | type] | unique | join(",")' <<<"$output")" = "number,string" ]
+	[ "$(jq -r '.rows[0].churn_convergence_p99_worst' <<<"$output")" = "500-1000" ]
+	[ "$(jq -c '.rows[1] | [.churn_rate, .valid_runs, .delta_p99_ms, .baseline_p50_ms, .churn_qps, .churn_convergence_p99_worst, .churn_convergence_overflow_runs]' <<<"$output")" = '[5,0,null,null,null,null,0]' ]
+	# No average is a string any more.
+	[ "$(jq '[.rows[] | to_entries[] | select(.key != "churn_convergence_p99_worst") | .value | strings] | length' <<<"$output")" = 0 ]
+}
+
+@test "005 (PL19, H10, H11): the platform record and its warnings reach every format's body: inputs that disagree, and kind nodes; inputs that agree on cloud nodes warn in none" {
+	# One sweep's dir (its steps' TSVs): one run, whatever their RUN_IDs.
+	RES="${BATS_TEST_TMPDIR}/sweep-h10"
+	mkdir -p "$RES"
+	two_pairs
+	# A second step's TSV in the same dir, on another mesh operator build for ctx-b.
+	{
+		echo "# RUN_ID=r2"
+		platform_fixture_lines | sed 's/ctx-b=sail-operator:1.31.1/ctx-b=sail-operator:1.31.2/'
+		echo "$HDR"
+		crow c9 0 baseline 50 2 5 OK N/A N/A
+		crow c9 1 churn 48 4 9 OK 30 99
+	} > "${RES}/churn-dataplane-r2.tsv"
+	local dis="input TSVs disagree on MESH_OPERATOR_BY_CONTEXT for ctx-b (sail-operator:1.31.1 or sail-operator:1.31.2)"
+	local kind="Nodes on kind (NODE_PROVIDER_BY_CONTEXT)"
+	local fmt t
+	for fmt in md charts; do
+		run --separate-stderr "$REPORT" --results-dir "$RES" --format "$fmt"
+		assert_success
+		assert_output --partial "> **Warning:** ${dis}"
+		assert_output --partial "> **Warning:** ${kind}"
+	done
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format md
+	assert_line '| ISTIOD_IMAGE_BY_CONTEXT | `ctx-a=pilot:1.30.5,ctx-b=pilot:1.30.5` |'
+	run --separate-stderr "$REPORT" --results-dir "$RES"
+	assert_line "# PLATFORM=kubernetes"
+	assert_line "# NODE_PROVIDER_BY_CONTEXT=ctx-a=kind,ctx-b=kind"
+	assert_output --partial "WARNING: ${dis}"
+	assert_output --partial "WARNING: ${kind}"
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format csv
+	assert_line "# MESH_OPERATOR_BY_CONTEXT=ctx-a=sail-operator:1.31.1,ctx-b=mixed:sail-operator:1.31.1;sail-operator:1.31.2"
+	assert_output --partial "# WARNING: ${dis}"
+	assert_output --partial "# WARNING: ${kind}"
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format json
+	assert_success
+	[ "$(jq '.warnings | length' <<<"$output")" = 2 ]
+	[[ "$(jq -r '.warnings[0]' <<<"$output")" == "${dis}"* ]]
+	[[ "$(jq -r '.warnings[1]' <<<"$output")" == "${kind}"* ]]
+	[ "$(jq -r '.metadata | "\(.platform) \(.test_platform) \(.proxy_image_by_context)"' <<<"$output")" = "kubernetes auto ctx-a=proxyv2:1.30.5,ctx-b=proxyv2:1.30.5" ]
+	[[ "$stderr" == *"warning: ${dis}"* ]]
+	[[ "$stderr" == *"WARNING: ${kind}"* ]]
+	# Cloud nodes, one build: no warning.
+	for t in r1 r2; do
+		sed 's/=kind/=aws/g; s#ctx-b=sail-operator:1.31.2#ctx-b=sail-operator:1.31.1#' \
+			"${RES}/churn-dataplane-${t}.tsv" > "${RES}/${t}.tmp"
+		mv "${RES}/${t}.tmp" "${RES}/churn-dataplane-${t}.tsv"
+	done
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format json
+	assert_success
+	[ "$(jq -c '.warnings' <<<"$output")" = '[]' ]
+	[ -z "$stderr" ] || { echo "$stderr"; false; }
+}
+
+@test "005: two sweeps in one dir stop the report; --allow-multi-run says so in every format; a varying key reads mixed (PL26); one sweep reports alone" {
+	local d fmt
+	for d in a b; do
+		mkdir -p "${RES}/sweep-${d}"
+		{
+			echo "# RUN_ID=r${d}"
+			echo "# HARNESS_SHA=h${d}"
+			echo "# ISTIO_VERSION=1.30.5"
+			echo "# QPS=$(if [[ $d == a ]]; then echo 50; else echo 100; fi)"
+			echo "$HDR"
+			crow c1 0 baseline 50 2 5 OK N/A N/A
+			crow c1 1 churn 48 4 9 OK 30 99
+		} > "${RES}/sweep-${d}/churn-dataplane-r${d}.tsv"
+	done
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format md
+	assert_failure 1
+	[ -z "$output" ]
+	[[ "$stderr" == *"error: ${RES} holds 2 runs"* ]]
+	[[ "$stderr" == *"  sweep-a:"$'\n'"    ${REPORT} --results-dir '${RES}/sweep-a'"* ]]
+	for fmt in text csv json md charts; do
+		run --separate-stderr "$REPORT" --results-dir "$RES" --allow-multi-run --format "$fmt"
+		assert_success
+		if [[ "$fmt" == json ]]; then
+			[ "$(jq -c '[.pooled_runs.runs, .pooled_runs.harness_sha, .metadata.qps, .metadata.run_id]' <<<"$output")" = '[2,["ha","hb"],"mixed:50,100","mixed:ra,rb"]' ]
+		else
+			assert_output --partial "This report pools 2 runs (--allow-multi-run): sweep-a, sweep-b. HARNESS_SHA: ha, hb. ISTIO_VERSION: 1.30.5."
+			# The first file's QPS is not the report's (it was first-wins).
+			assert_output --partial "mixed:50,100"
+		fi
+	done
+	run --separate-stderr "$REPORT" --results-dir "${RES}/sweep-b" --format json
+	assert_success
+	[ "$(jq -c '[.pooled_runs.runs, .metadata.qps]' <<<"$output")" = '[1,"100"]' ]
+}
+
+@test "005: the quick start's runs (one TSV named smoke, 003's istiod-diag under its own id) separate with the printed commands, pasted twice, and each printed report runs" {
+	local id1=20261016T100000Z-1 id2=20261016T100500Z-2 id3=20261016T110000Z-3 cmd pass
+	# 002 and 003 of one quick start: the TSV is churn-dataplane-smoke.tsv (no id in its
+	# name), its rows carry 002's and 003's ids, and 003's istiod-diag folder has the second.
+	{
+		echo "# RUN_ID=${id1}"
+		echo "$HDR"
+		crow c1 0 baseline 50 2 5 OK N/A N/A | sed "s/^r1/${id1}/"
+		crow c1 1 churn 48 4 9 OK 30 99 | sed "s/^r1/${id2}/"
+	} > "${RES}/churn-dataplane-smoke.tsv"
+	mkdir -p "${RES}/istiod-diag-${id2}"
+	: > "${RES}/istiod-diag-${id2}/notes.txt"
+	{
+		echo "# RUN_ID=${id3}"
+		echo "$HDR"
+		crow c1 0 baseline 50 2 5 OK N/A N/A | sed "s/^r1/${id3}/"
+		crow c1 1 churn 48 4 9 OK 30 99 | sed "s/^r1/${id3}/"
+	} > "${RES}/churn-dataplane-other.tsv"
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format md
+	assert_failure 1
+	[[ "$stderr" == *"error: ${RES} holds 2 runs"* ]]
+	[[ "$stderr" == *"    for f in '${RES}/churn-dataplane-smoke.tsv'; do"* ]]
+	[[ "$stderr" == *"-name '*${id1}*' -o -name '*${id2}*'"* ]]
+	for pass in 1 2; do
+		while IFS= read -r cmd; do
+			bash -c "$cmd"
+		done < <(sed -n 's/^    \(mkdir .*\|for f in .*\|find .*\)$/\1/p' <<<"$stderr")
+	done
+	[ -f "${RES}/run-${id1}/churn-dataplane-smoke.tsv" ]
+	[ -f "${RES}/run-${id1}/istiod-diag-${id2}/notes.txt" ]
+	[ -f "${RES}/run-${id3}/churn-dataplane-other.tsv" ]
+	[ -z "$(find "$RES" -mindepth 1 -maxdepth 1 ! -name 'run-*')" ]
+	# Each printed report command (one per run) now succeeds.
+	[ "$(grep -c "^    ${REPORT} --results-dir '${RES}/run-" <<<"$stderr")" = 2 ]
+	while IFS= read -r cmd; do
+		run --separate-stderr bash -c "$cmd"
+		assert_success
+		assert_output --partial "sweep-summary"
+		assert_output --partial "valid_runs"
+	done < <(sed -n "s|^    \(${REPORT} --results-dir .*\)$|\1|p" <<<"$stderr")
+	# The parent still holds two runs, each alone in its run-<id>/: only report commands.
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format md
+	assert_failure 1
+	[[ "$stderr" == *"  ${id3} (alone in ${RES}/run-${id3}):"* && "$stderr" == *"  ${id1} (alone in ${RES}/run-${id1}):"* ]]
+	[[ "$stderr" != *"mkdir"* && "$stderr" != *"run-${id1}/run-"* ]]
+}
+
+@test "005: the recorded outcome is in every format" {
+	local note="Istio version check at the start: c2: not ready (Istio CR state is IstioCNINotHealthy) after waiting 60s"
+	{
+		echo "# RUN_ID=r1"
+		echo "$HDR"
+		crow c1 0 baseline 50 2 5 OK N/A N/A
+		crow c1 1 churn 48 4 9 OK 30 99
+	} > "${RES}/churn-dataplane-r1.tsv"
+	printf '%s\n' STATUS=finished 'RUN_ID=r1' 'EXIT=0' TOTAL=1 FAILED=0 "NOTE=${note}" > "${RES}/sweep-outcome.txt"
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format csv
+	assert_success
+	assert_line "# SWEEP_OUTCOME_RUN_ID=r1"
+	assert_line "# SWEEP_OUTCOME_NOTE=${note}"
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format json
+	[ "$(jq -r '.sweep_outcomes[0].notes[0]' <<<"$output")" = "$note" ]
+	run --separate-stderr "$REPORT" --results-dir "$RES" --format md
+	assert_output --partial "> - warning: ${note}"
+}

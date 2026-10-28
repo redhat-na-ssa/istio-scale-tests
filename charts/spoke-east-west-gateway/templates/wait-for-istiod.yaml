@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wait-for-istiod-eastwest
+  namespace: istio-system
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+  labels:
+    {{- include "spoke-east-west-gateway.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wait-for-istiod-eastwest
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: wait
+          image: {{ .Values.waitForIstiod.image | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "Waiting for istiod to be ready..."
+              # Real elapsed time: a request that hangs counts, and none hangs over 5s.
+              START=$(date +%s)
+              while [ $(($(date +%s) - START)) -lt 600 ]; do
+                if curl -sf --max-time 5 http://istiod.istio-system.svc:15014/version >/dev/null 2>&1; then
+                  echo "istiod is ready. Gateway sync can proceed."
+                  exit 0
+                fi
+                echo "istiod not yet ready (elapsed $(($(date +%s) - START))s)..."
+                sleep 10
+              done
+              echo "ERROR: istiod not ready after 600s"
+              exit 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            {{- with .Values.waitForIstiod.runAsUser }}
+            runAsUser: {{ . }}
+            {{- end }}
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault

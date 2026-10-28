@@ -1,0 +1,58 @@
+{{- if .Values.tuningBaseline.telemetryFiltering.enabled }}
+{{- /* Disable client-side request metrics. */}}
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: tuning-metrics
+  namespace: istio-system
+  labels:
+    {{- include "spoke-ossm.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.tuning | quote }}
+  {{- end }}
+spec:
+  metrics:
+    - providers:
+        - name: prometheus
+      overrides:
+        - match:
+            mode: CLIENT
+            metric: REQUEST_COUNT
+          disabled: true
+        - match:
+            mode: CLIENT
+            metric: REQUEST_DURATION
+          disabled: true
+        - match:
+            mode: CLIENT
+            metric: REQUEST_SIZE
+          disabled: true
+        - match:
+            mode: CLIENT
+            metric: RESPONSE_SIZE
+          disabled: true
+{{- end }}
+{{- if .Values.tuningBaseline.accessLogFiltering.enabled }}
+{{- /* Access-log only server-side responses >= 400. */}}
+---
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: tuning-access-log
+  namespace: istio-system
+  labels:
+    {{- include "spoke-ossm.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.tuning | quote }}
+  {{- end }}
+spec:
+  accessLogging:
+    - providers:
+        - name: envoy
+      match:
+        mode: SERVER
+      filter:
+        expression: "response.code >= 400"
+{{- end }}

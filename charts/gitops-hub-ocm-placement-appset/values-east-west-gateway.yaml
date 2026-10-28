@@ -1,0 +1,28 @@
+# Preset: east-west gateway + cross-network Gateway CR on every mesh member.
+identity:
+  component: spoke-east-west-gateway
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-spoke-ew-gw
+  roleBindingName: openshift-gitops-ocm-placement-spoke-ew-gw
+
+argocdApplicationControllerRbac:
+  roleName: gitops-spoke-east-west-gateway-appset-argocd-sync
+  roleBindingName: gitops-spoke-east-west-gateway-appset-argocd-sync
+
+applicationSet:
+  name: spoke-east-west-gateway
+
+destination:
+  mode: clusterName
+  namespace: istio-system
+
+template:
+  applicationNameSuffix: east-west-gateway
+  source:
+    path: charts/spoke-east-west-gateway
+    helm:
+      releaseName: spoke-east-west-gateway
+      parameters:
+        - name: clusterName
+          value: "{{clusterName}}"

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Clean up all churn-test resources from target clusters.
+#
+# Usage:
+#   ./tests/churn/005-cleanup.sh [--config FILE] [--contexts CSV] [--dry-run]
+# ci-dry-run: --contexts ci-dummy
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/common.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/config.sh"
+# --config FILE: export the file's keys before versions.env/options.env fill in defaults.
+config_preload churn "$@"
+# shellcheck disable=SC1091
+source "${ROOT}/config/versions.env"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/platform.sh"  # platform_validate (TEST_PLATFORM)
+
+CONTEXTS_CSV=""
+DRY_RUN=0
+NS="${CHURN_TEST_NAMESPACE:-churn-test}"
+
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [options]
+
+Deletes the '$NS' namespace on every context.
+
+  --config FILE    Run config of KEY=value lines (config/options.env keys).
+                   Precedence: flag > --config > environment > default.
+  --contexts CSV   Kube contexts to clean up (default: \$SETUP_CONTEXTS).
+  --dry-run        Show what would be deleted without deleting.
+  -h, --help       Show this help.
+
+Environment (config/options.env describes each): SETUP_CONTEXTS, CHURN_TEST_NAMESPACE.
+
+Exit codes: 0 cleaned up (or printed); 1 an error or an unreachable context.
+
+See tests/churn/README.md.
+EOF
+}
+
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--config)
+		# Loaded by config_preload above.
+		[[ -n "${2:-}" ]] || die "--config requires a value"
+		shift 2
+		;;
+	--contexts)
+		[[ -n "${2:-}" ]] || die "--contexts requires a value"
+		CONTEXTS_CSV="$2"
+		shift 2
+		;;
+	--dry-run)
+		DRY_RUN=1
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		die "unknown option: $1 (try --help)"
+		;;
+	esac
+done
+
+platform_validate
+KUBECTL=()
+resolve_kubectl KUBECTL
+
+CONTEXTS=()
+if [[ -n "$CONTEXTS_CSV" ]]; then
+	split_contexts "$CONTEXTS_CSV" CONTEXTS --contexts
+else
+	split_contexts "$SETUP_CONTEXTS" CONTEXTS SETUP_CONTEXTS
+fi
+((${#CONTEXTS[@]})) || die "no contexts resolved"
+
+echo "=== Churn test cleanup ==="
+echo "Contexts: ${CONTEXTS[*]}"
+echo "Namespace: $NS"
+((DRY_RUN)) && echo "Mode: dry-run"
+echo ""
+
+PIDS=()
+for ctx in "${CONTEXTS[@]}"; do
+	(
+		echo "--- Cleaning up context: $ctx ---"
+		if ((DRY_RUN)); then
+			echo "  [dry-run] ${KUBECTL[*]} --context=$ctx delete namespace $NS --ignore-not-found=true"
+			exit 0
+		fi
+		# --ignore-not-found: a missing namespace is empty output; an unreachable
+		# context is an error, not "already clean".
+		if ! found=$("${KUBECTL[@]}" --context="$ctx" get namespace "$NS" --ignore-not-found -o name); then
+			echo "  [$ctx] error: could not query namespace $NS" >&2
+			exit 1
+		fi
+		if [[ -z "$found" ]]; then
+			echo "  [$ctx] Namespace $NS does not exist, skipping."
+			exit 0
+		fi
+		"${KUBECTL[@]}" --context="$ctx" delete namespace "$NS" --ignore-not-found=true \
+			|| { echo "  [$ctx] error: could not delete namespace $NS" >&2; exit 1; }
+		echo "  [$ctx] Done."
+	) &
+	PIDS+=($!)
+done
+
+FAILED=0
+for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+	wait "$pid" || FAILED=$((FAILED + 1))
+done
+
+echo ""
+if ((FAILED > 0)); then
+	echo "Cleanup finished with $FAILED failed context(s)."
+	exit 1
+fi
+echo "Cleanup complete."

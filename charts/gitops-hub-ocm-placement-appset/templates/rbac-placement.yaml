@@ -1,0 +1,30 @@
+{{- /* Only the clusterDecisionResource generator reads PlacementDecisions. */}}
+{{- if and .Values.placementRbac.create (eq (include "gitops-hub-ocm-placement-appset.generator" .) "clusterDecisionResource") }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ required "placementRbac.roleName is required" .Values.placementRbac.roleName | quote }}
+  namespace: {{ .Values.applicationSetNamespace | quote }}
+  labels:
+{{- include "gitops-hub-ocm-placement-appset.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["cluster.open-cluster-management.io"]
+    resources: ["placementdecisions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ required "placementRbac.roleBindingName is required" .Values.placementRbac.roleBindingName | quote }}
+  namespace: {{ .Values.applicationSetNamespace | quote }}
+  labels:
+{{- include "gitops-hub-ocm-placement-appset.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.placementRbac.roleName | quote }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.placementRbac.applicationSetServiceAccountName | quote }}
+    namespace: {{ .Values.applicationSetControllerNamespace | quote }}
+{{- end }}

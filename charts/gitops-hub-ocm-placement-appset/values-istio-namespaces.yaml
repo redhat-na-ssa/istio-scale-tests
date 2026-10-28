@@ -1,0 +1,29 @@
+# Preset: istio-system and istio-cni namespaces on every mesh member.
+identity:
+  component: spoke-istio-namespaces
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-spoke-istio-namespaces
+  roleBindingName: openshift-gitops-ocm-placement-spoke-istio-namespaces
+
+argocdApplicationControllerRbac:
+  roleName: gitops-spoke-istio-namespaces-appset-argocd-sync
+  roleBindingName: gitops-spoke-istio-namespaces-appset-argocd-sync
+
+applicationSet:
+  name: spoke-istio-namespaces
+
+destination:
+  mode: clusterName
+  namespace: default
+
+template:
+  applicationNameSuffix: istio-namespaces
+  source:
+    path: charts/spoke-istio-namespaces
+    helm:
+      releaseName: spoke-istio-namespaces
+      parameters:
+        # Sets the istio-system topology.istio.io/network label.
+        - name: clusterName
+          value: "{{clusterName}}"

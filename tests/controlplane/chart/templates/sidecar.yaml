@@ -1,0 +1,58 @@
+{{- include "controlplane-test.validateSidecarScoping" . -}}
+{{- include "controlplane-test.validateGrowth" . -}}
+{{- $scope := .Values.sidecarScoping | default "none" -}}
+{{- $extra := default (list) .Values.sidecarExtraEgressHosts -}}
+{{- if or (eq $scope "namespace") (eq $scope "wide") }}
+{{- /* One namespace-wide Sidecar (no workloadSelector) per workload namespace. wide
+       uses the same name with egress to every host ("*" over "*"), so a re-apply
+       switches the scoping in place. */ -}}
+{{- range $ns := fromYamlArray (include "controlplane-test.namespaces" .) }}
+---
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: default
+  namespace: {{ $ns }}
+  labels:
+    {{- include "controlplane-test.labels" $ | nindent 4 }}
+    controlplane-test.scope: {{ $scope }}
+spec:
+  egress:
+    - hosts:
+        {{- if eq $scope "wide" }}
+        - "*/*"
+        {{- else }}
+        - "./*"
+        - "istio-system/*"
+        {{- range $h := $extra }}
+        - {{ $h | quote }}
+        {{- end }}
+        {{- end }}
+{{- end }}
+{{- else if eq $scope "explicit" }}
+{{- /* One Sidecar per service, in its namespace. The app=dummy-svc-<i> selector also
+       covers the version-split Deployments of trafficConfig.mode=vsdr. */ -}}
+{{- range $i := until (.Values.serviceCount | int) }}
+---
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: dummy-svc-{{ $i }}
+  namespace: {{ include "controlplane-test.namespaceForService" (dict "ctx" $ "idx" $i) }}
+  labels:
+    app: dummy-svc-{{ $i }}
+    {{- include "controlplane-test.labels" $ | nindent 4 }}
+    controlplane-test.scope: explicit
+spec:
+  workloadSelector:
+    labels:
+      app: dummy-svc-{{ $i }}
+  egress:
+    - hosts:
+        - "./*"
+        - "istio-system/*"
+        {{- range $h := $extra }}
+        - {{ $h | quote }}
+        {{- end }}
+{{- end }}
+{{- end }}

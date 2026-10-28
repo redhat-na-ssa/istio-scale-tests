@@ -1,0 +1,5 @@
+apiVersion: v2
+name: spoke-ossm-operator
+description: Installs the Red Hat OSSM 3 (Sail) operator via OLM on each spoke cluster.
+type: application
+version: 0.1.0

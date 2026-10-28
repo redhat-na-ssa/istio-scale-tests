@@ -1,0 +1,30 @@
+{{- if or (eq .Values.role "server") (eq .Values.role "both") }}
+{{- if not .Values.clusterName }}{{ fail "clusterName is required (pass --set clusterName=...)" }}{{ end }}
+{{- $clusterNames := list .Values.clusterName }}
+{{- if .Values.allClusterNames }}
+{{- $clusterNames = .Values.allClusterNames }}
+{{- end }}
+{{- range $cn := $clusterNames }}
+---
+# Per-cluster Service: selects only the server pod labelled cluster={{ $cn }}.
+# From the {{ $cn }} cluster it is the local baseline target; from any other
+# cluster it has no local endpoint, so traffic crosses the east-west gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataplane-server-{{ $cn }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    {{- include "dataplane-test.server.labels" $ | nindent 4 }}
+    cluster: {{ $cn }}
+spec:
+  selector:
+    {{- include "dataplane-test.server.selectorLabels" $ | nindent 4 }}
+    cluster: {{ $cn }}
+  ports:
+    - name: http
+      port: {{ $.Values.service.port }}
+      protocol: TCP
+      targetPort: {{ $.Values.service.port }}
+{{- end }}
+{{- end }}

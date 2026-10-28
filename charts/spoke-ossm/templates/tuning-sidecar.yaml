@@ -1,0 +1,66 @@
+{{- if .Values.tuningBaseline.sidecar.enabled }}
+{{- /*
+  The root-namespace Sidecar (no workloadSelector) limits every sidecar proxy's
+  egress to egressHosts. Istio applies no Sidecar to a gateway (a router proxy:
+  both gateway charts run `proxy router`), so the gateways keep all-namespace
+  egress anyway; the two workloadSelector Sidecars below change nothing for them
+  and only record that they need it.
+*/}}
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: default
+  namespace: istio-system
+  labels:
+    {{- include "spoke-ossm.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.tuning | quote }}
+  {{- end }}
+spec:
+  egress:
+    - hosts:
+        {{- range $h := .Values.tuningBaseline.sidecar.egressHosts }}
+        - {{ $h | quote }}
+        {{- end }}
+---
+{{- /* Ingress gateway: full egress (it routes mesh-verify traffic across clusters; a router proxy has it anyway). */}}
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: gateway-ingress-full-egress
+  namespace: istio-system
+  labels:
+    {{- include "spoke-ossm.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.tuning | quote }}
+  {{- end }}
+spec:
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+  egress:
+    - hosts:
+        - "*/*"
+---
+{{- /* East-west gateway: full egress (AUTO_PASSTHROUGH does not need it; a router proxy has it anyway). */}}
+apiVersion: networking.istio.io/v1
+kind: Sidecar
+metadata:
+  name: gateway-eastwest-full-egress
+  namespace: istio-system
+  labels:
+    {{- include "spoke-ossm.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.tuning | quote }}
+  {{- end }}
+spec:
+  workloadSelector:
+    labels:
+      istio: eastwestgateway
+  egress:
+    - hosts:
+        - "*/*"
+{{- end }}

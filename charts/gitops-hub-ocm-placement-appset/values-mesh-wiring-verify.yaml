@@ -1,0 +1,33 @@
+# Preset: mesh-wiring health gate on every mesh member. Installed by Terraform
+# (platform_gitops.tf), which sets template.source.helm.valuesObject.expectedMembers to the
+# mesh size and expectedClusters to the members' names.
+identity:
+  component: mesh-wiring-verify
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-mesh-wiring-verify
+  roleBindingName: openshift-gitops-ocm-placement-mesh-wiring-verify
+
+argocdApplicationControllerRbac:
+  roleName: gitops-mesh-wiring-verify-appset-argocd-sync
+  roleBindingName: gitops-mesh-wiring-verify-appset-argocd-sync
+
+applicationSet:
+  name: mesh-wiring-verify
+
+destination:
+  mode: clusterName
+  namespace: mesh-wiring-verify
+
+template:
+  applicationNameSuffix: mesh-wiring-verify
+  source:
+    path: charts/mesh-wiring-verify
+    helm:
+      releaseName: mesh-wiring-verify
+      # 0 and no expectedClusters = consistency-only checks (no Terraform override).
+      valuesObject:
+        expectedMembers: 0
+        # The member's own name, which the gate finds in expectedClusters (the template
+        # rewrites {{clusterName}} for the generator, as in the other presets' parameters).
+        clusterName: "{{clusterName}}"

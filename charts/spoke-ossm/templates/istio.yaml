@@ -1,0 +1,46 @@
+{{- $clusterName := required "clusterName is required (set per cluster by the ApplicationSet)" .Values.clusterName }}
+apiVersion: sailoperator.io/v1
+kind: Istio
+metadata:
+  name: default
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.istio | quote }}
+  {{- end }}
+spec:
+  version: {{ .Values.istioVersion | quote }}
+  profile: {{ required "profile is required (a Sail profile: default, openshift, ...)" .Values.profile }}
+  namespace: istio-system
+  values:
+    global:
+      meshID: {{ .Values.meshID | quote }}
+      network: {{ printf "%s-%s" $clusterName .Values.networkSuffix | quote }}
+      multiCluster:
+        clusterName: {{ $clusterName | quote }}
+      enableReaderRBAC: true
+      {{- if .Values.meshNetworks }}
+      meshNetworks:
+        {{- toYaml .Values.meshNetworks | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy }}
+      proxy:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    pilot:
+      cni:
+        enabled: true
+      autoscaleEnabled: {{ .Values.pilot.autoscaleEnabled }}
+      {{- if not .Values.pilot.autoscaleEnabled }}
+      replicaCount: {{ .Values.pilot.replicaCount }}
+      {{- end }}
+      {{- with .Values.pilot.resources }}
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    meshConfig:
+      accessLogFile: {{ .Values.accessLogFile | quote }}
+      accessLogEncoding: {{ .Values.accessLogEncoding | quote }}
+      {{- if .Values.tuningBaseline.discoverySelectors.enabled }}
+      discoverySelectors:
+        {{- toYaml .Values.tuningBaseline.discoverySelectors.selectors | nindent 8 }}
+      {{- end }}

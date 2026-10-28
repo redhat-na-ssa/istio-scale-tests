@@ -1,0 +1,33 @@
+# Preset: Istio + IstioCNI CRs on every mesh member.
+identity:
+  component: spoke-ossm
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-spoke-ossm
+  roleBindingName: openshift-gitops-ocm-placement-spoke-ossm
+
+argocdApplicationControllerRbac:
+  roleName: gitops-spoke-ossm-appset-argocd-sync
+  roleBindingName: gitops-spoke-ossm-appset-argocd-sync
+
+applicationSet:
+  name: spoke-ossm
+
+destination:
+  mode: clusterName
+  namespace: istio-system
+
+template:
+  applicationNameSuffix: ossm
+  ignoreDifferences:
+    - group: sailoperator.io
+      kind: Istio
+      jsonPointers:
+        - /spec/values/global/meshNetworks
+  source:
+    path: charts/spoke-ossm
+    helm:
+      releaseName: spoke-ossm
+      parameters:
+        - name: clusterName
+          value: "{{clusterName}}"

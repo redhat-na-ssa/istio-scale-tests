@@ -1,0 +1,5 @@
+apiVersion: v2
+name: hub-kubeconfig-from-argosecret
+description: Hub-only ExternalSecret that turns a Terraform-owned Argo CD cluster Secret into a kubeconfig Secret for one ManagedCluster.
+type: application
+version: 0.3.0

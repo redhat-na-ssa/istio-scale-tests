@@ -1,0 +1,51 @@
+# Standalone Argo CD Application (not part of the app-of-apps): deploys the
+# mesh-verify echo workload on every mesh member.
+# Keep the <repo-url>, <revision>, <platform> and <gitops-namespace> placeholders in git
+# and fill them in on the way to the hub, from what the hub's root Application syncs (set
+# by terraform/platform), so the check deploys the same charts as the mesh. Applied
+# unfilled, kubectl fails at once (namespaces "<gitops-namespace>" not found); with only
+# <repo-url> or <revision> left, the Application shows a ComparisonError and deploys nothing.
+# Apply:  NS=argocd PLATFORM=kubernetes   # openshift: NS=openshift-gitops PLATFORM=openshift
+#         read -r REPO REV < <(kubectl --context <hub-ctx> -n "$NS" \
+#           get applications.argoproj.io hub-gitops-root \
+#           -o jsonpath='{.spec.source.repoURL} {.spec.source.targetRevision}')
+#         sed -e "s|<repo-url>|${REPO:?}|g" -e "s|<revision>|${REV:?}|g" \
+#           -e "s|<platform>|${PLATFORM}|g" -e "s|<gitops-namespace>|${NS}|g" charts/mesh-verify-appset.yaml \
+#           | kubectl --context <hub-ctx> apply -f -
+# Remove: the same sed, piped to kubectl --context <hub-ctx> delete -f - (the finalizer
+#         also removes the ApplicationSet and the per-member mesh-verify workloads)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mesh-verify-appset
+  namespace: <gitops-namespace>
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/name: mesh-verify
+    app.kubernetes.io/component: mesh-verify-appset
+spec:
+  project: default
+  source:
+    repoURL: <repo-url>
+    targetRevision: <revision>
+    path: charts/gitops-hub-ocm-placement-appset
+    helm:
+      releaseName: gitops-mesh-verify-appset
+      valueFiles:
+        - values-mesh-verify.yaml
+        - platform-<platform>.yaml
+      parameters:
+        - name: repo.url
+          value: <repo-url>
+        - name: repo.revision
+          value: <revision>
+        - name: placement.name
+          value: acm-openshift-gitops-placement
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: <gitops-namespace>
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true

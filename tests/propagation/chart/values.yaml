@@ -1,0 +1,33 @@
+clusterName: ""
+
+namespace: propagation-test
+
+watcher:
+  image:
+    repository: busybox
+    # Keep in sync with BUSYBOX_VERSION in config/versions.env (001 passes --set watcher.image.tag).
+    tag: "1.37.0"
+  replicaCount: 1
+
+# Pre-warmed backer: one Ready http-echo pod (sidecar up, image pulled). The
+# canary Service selects it only after the probe labels the pod at t0, so P3
+# measures config propagation, not pod startup.
+#   enabled - render the backer Deployment + canary Service (001 sets true).
+#   active  - render the pod already labelled active (helm template checks only;
+#             the probe flips the label at runtime with `kubectl label pod`).
+backer:
+  enabled: false
+  active: false
+  image:
+    repository: hashicorp/http-echo
+    # Keep in sync with HTTP_ECHO_VERSION in config/versions.env (001 passes --set backer.image.tag).
+    tag: "1.0"
+    pullPolicy: IfNotPresent
+
+service:
+  port: 8080
+
+# Numeric UID for the test containers: the busybox and fortio images run as root, so
+# Kubernetes cannot start them under runAsNonRoot without one. values-openshift.yaml clears
+# it: OpenShift assigns a UID from the namespace range (tests/lib/platform.sh adds it there).
+runAsUser: 65534

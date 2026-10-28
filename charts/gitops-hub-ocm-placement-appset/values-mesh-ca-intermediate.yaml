@@ -1,0 +1,24 @@
+# Preset: hub-only intermediate CA Certificate per mesh member.
+identity:
+  component: hub-mesh-ca-intermediate
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-hub-mesh-ca
+  roleBindingName: openshift-gitops-ocm-placement-hub-mesh-ca
+
+argocdApplicationControllerRbac:
+  roleName: gitops-hub-mesh-ca-intermediate-appset-argocd-sync
+  roleBindingName: gitops-hub-mesh-ca-intermediate-appset-argocd-sync
+
+applicationSet:
+  name: hub-mesh-ca-intermediate
+
+destination:
+  mode: inClusterServer
+  # The chart's namespace (its values.yaml namespace: cert-manager), on either platform.
+  namespace: cert-manager
+
+template:
+  applicationNameSuffix: hub-mesh-ca-intermediate
+  source:
+    path: charts/hub-mesh-ca-intermediate

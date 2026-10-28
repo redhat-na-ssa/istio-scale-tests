@@ -1,0 +1,24 @@
+{{- if not .Values.managedCluster.name }}
+{{- fail "managedCluster.name is required (cluster name / namespace on hub)" }}
+{{- end }}
+apiVersion: cluster.open-cluster-management.io/v1
+kind: ManagedCluster
+metadata:
+  name: {{ .Values.managedCluster.name }}
+{{- if .Values.keepOnUninstall }}
+  annotations:
+    helm.sh/resource-policy: keep
+{{- end }}
+  labels:
+{{- $defaults := .Values.defaultLabels | default dict }}
+{{- $extra := .Values.managedCluster.labels | default dict }}
+{{- $cs := .Values.clustersetName | default "istio-scale-tests" }}
+{{- $membership := dict "cluster.open-cluster-management.io/clusterset" $cs }}
+{{- $lbl := merge $defaults $membership $extra }}
+{{- toYaml $lbl | nindent 4 }}
+spec:
+  hubAcceptsClient: true
+{{- if .Values.managedCluster.clientConfigs }}
+  managedClusterClientConfigs:
+{{- toYaml .Values.managedCluster.clientConfigs | nindent 4 }}
+{{- end }}

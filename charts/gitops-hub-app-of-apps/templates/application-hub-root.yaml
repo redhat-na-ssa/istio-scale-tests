@@ -1,0 +1,32 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hub-gitops-root
+  namespace: {{ .Values.gitopsNamespace | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/name: gitops-hub-app-of-apps
+    app.kubernetes.io/component: app-of-apps-root
+spec:
+  project: default
+  source:
+    repoURL: {{ required "repo.url is required (the Git URL Argo CD syncs this repo from)" .Values.repo.url | quote }}
+    targetRevision: {{ required "repo.revision is required" .Values.repo.revision | quote }}
+    path: charts/gitops-hub-apps
+    helm:
+      valuesObject:
+        platform: {{ .Values.platform | quote }}
+        gitopsNamespace: {{ .Values.gitopsNamespace | quote }}
+        repo:
+          url: {{ .Values.repo.url | quote }}
+          revision: {{ .Values.repo.revision | quote }}
+        apps:
+          {{- toYaml (.Values.apps | default dict) | nindent 10 }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.gitopsNamespace | quote }}
+  syncPolicy:
+    automated:
+      prune: {{ .Values.syncPolicy.automated.prune }}
+      selfHeal: {{ .Values.syncPolicy.automated.selfHeal }}

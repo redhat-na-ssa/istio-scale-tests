@@ -1,0 +1,48 @@
+# Copy to terraform.tfvars (gitignored) and adjust.
+# export RHCS_TOKEN='...'   # or set rhcs_token below (avoid committing secrets)
+
+# --- Required ---
+
+aws_region        = "us-east-2"
+openshift_version = "4.21.11"
+cluster_count     = 3
+
+# --- Cluster naming and networking ---
+
+# Terraform keys, OCM cluster names, and kubectl/oc context names.
+# With defaults below: cluster-001, cluster-002, cluster-003.
+cluster_name_format = "cluster-%03d"
+cluster_index_start = 1
+
+# VPC CIDRs per cluster (non-overlapping). Defaults: 10.0.0.0/16, 10.1.0.0/16, ...
+vpc_cidr_format      = "10.%d.0.0/16"
+vpc_cidr_index_start = 0
+
+# --- Optional ---
+
+common_tags = {
+  environment = "scale-test"
+}
+
+# Set false if your account cannot change service quotas via API.
+# manage_service_quotas = false
+
+# Set false to skip VPC peering between clusters (east-west traffic will
+# route over the public internet instead).
+# vpc_peering_enabled = false
+
+# Shared overrides for every cluster:
+# cluster_defaults = {
+#   replicas             = 2
+#   compute_machine_type = "m7i.xlarge"
+#   worker_autoscale_min = 2
+#   worker_autoscale_max = 10
+# }
+
+# Per-cluster overrides (merge over cluster_defaults):
+# cluster_overrides = {
+#   "cluster-001" = {                     # hub — more capacity for ArgoCD + ACM
+#     compute_machine_type = "m5.4xlarge"
+#     worker_autoscale_max = 15
+#   }
+# }

@@ -1,0 +1,5 @@
+apiVersion: v2
+name: gitops-hub-app-of-apps
+description: Root Argo CD Application (hub-gitops-root) that renders charts/gitops-hub-apps.
+type: application
+version: 0.3.0

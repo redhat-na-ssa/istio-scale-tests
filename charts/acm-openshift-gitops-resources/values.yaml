@@ -1,0 +1,21 @@
+# Namespace of the Argo CD instance; the Placement and ManagedClusterSetBinding live here.
+gitopsNamespace: openshift-gitops
+
+# ManagedClusterSet name; spokes carry cluster.open-cluster-management.io/clusterset=<clusterSet>
+# (charts/acm-managed-cluster clustersetName).
+clusterSet: istio-scale-tests
+
+managedClusterSet:
+  # Set false if the ManagedClusterSet already exists.
+  create: true
+
+managedClusterSetBinding:
+  # Defaults to clusterSet when empty.
+  name: ""
+
+placement:
+  name: acm-openshift-gitops-placement
+  # Skip the ACM hub (the ManagedCluster labeled local-cluster).
+  excludeHubLocalClusterLabel: true
+  # Select only ManagedClusters labeled istio-mesh-member=true.
+  requireMeshMemberLabel: true

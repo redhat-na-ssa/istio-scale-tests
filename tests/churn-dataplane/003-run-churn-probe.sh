@@ -1,0 +1,663 @@
+#!/usr/bin/env bash
+# Phase 2 of the co-exec test: run fortio identically to the baseline phase,
+# while a deterministic churn driver scales churn-target Deployments at a
+# configurable rate. Emits a churn-phase TSV row, and if --baseline-file points
+# at a TSV containing a matching baseline row, also computes Δp99_ms.
+# A window whose HTTP 200 share is below COEXEC_MIN_PCT_200 is ERROR_RATE_HIGH
+# (tests/lib/fortio.sh, same rule as 002). No reach check here: 002 runs it before
+# the baseline, and a baseline that is not OK already makes Δp99 N/A.
+#
+# Usage:
+#   ./tests/churn-dataplane/003-run-churn-probe.sh \
+#       --source-context CTX --churn-rate 5 [options]
+#   ./tests/churn-dataplane/003-run-churn-probe.sh --config tests/churn-dataplane/configs/smoke.env \
+#       --source-context <mesh-a-ctx> --churn-rate 1
+# ci-dry-run: --source-context ci-dummy --churn-rate 5
+set -euo pipefail
+# A loud ERR trap (separate signal from the EXIT cleanup trap installed later, so
+# both run). Self-reports an UNEXPECTED abort.
+trap 'rc=$?; echo "FATAL: ${0##*/} aborted (exit ${rc}) at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/common.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/config.sh"  # config_preload, config_preamble_lines
+# --config FILE: export the file's keys before versions.env/options.env fill in defaults.
+config_preload churn-dataplane "$@"
+# shellcheck disable=SC1091
+source "${ROOT}/config/versions.env"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/timestamp.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/preamble.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/platform.sh"  # platform_probe, platform_preamble_lines (the platform record)
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/metrics.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/fanout.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/fortio.sh"
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/reach.sh"  # reach_summarize (pct_200, top_code)
+# shellcheck disable=SC1091
+source "${ROOT}/tests/lib/istiod-diag.sh"  # istiod_diag_capture (restart evidence)
+
+SOURCE_CTX=""
+REMOTE_CONTEXTS_CSV=""
+MESH_SIZE=""
+COMBO_ID=""
+RUN_ID_OPT=""
+CHURN_RATE=""
+DURATION="${COEXEC_CHURN_DURATION_SEC:-60}"
+QPS="${COEXEC_QPS:-200}"
+CONNECTIONS="${COEXEC_NUM_CONNECTIONS:-8}"
+SETTLE_SEC="${COEXEC_SETTLE_SEC:-10}"
+CHURN_DEPLOYMENT_COUNT_OPT="${CHURN_DEPLOYMENT_COUNT:-5}"
+CHURN_BASE_REPLICAS_OPT="${CHURN_BASE_REPLICAS:-1}"
+CHURN_SCALE_TO_OPT="${CHURN_SCALE_TO_REPLICAS:-5}"
+CHURN_SEED="${COEXEC_CHURN_SEED:-42}"
+NS="${COEXEC_TEST_NAMESPACE:-churn-dataplane-test}"
+MIN_PCT_200="${COEXEC_MIN_PCT_200:-0.99}"
+# Recorded in a preamble this script bootstraps (same keys as 002/004, PL36).
+ON_UNREACHABLE="${REACH_ON_UNREACHABLE:-warn}"
+REACH_REQUESTS="${REACH_REQUESTS:-10}"
+OUTPUT_FILE=""
+OUTPUT_DIR="$(config_repo_path "${COEXEC_RESULTS_DIR}")"
+BASELINE_FILE=""
+DRY_RUN=0
+# Live tuning levers + sidecar egress hosts for the TSV preamble. The sweep queries
+# them once and passes them in; standalone runs record "unknown".
+TUNING_BASELINE="unknown"
+SIDECAR_EGRESS_HOSTS="unknown"
+
+usage() {
+	cat <<EOF
+Usage: $(basename "$0") [options]
+
+Runs one fortio load from the source's client pod while it issues --churn-rate x --duration
+scale operations on the churn targets of every context: the churn row of a combo (status OK,
+FAILED, PERCENTILE_MISSING, ERROR_RATE_HIGH, POISONED_RESTART, POISONED_SCRAPE or
+CHURN_RATE_NOT_MET).
+
+  --config FILE            Run config of KEY=value lines (config/options.env keys).
+                           Precedence: flag > --config > environment > default.
+  --source-context CTX     Context where fortio-client runs (required).
+  --remote-contexts CSV    Other contexts in the mesh (churn applies to ALL).
+  --mesh-size N            Mesh-size tag (default: 1 + remotes).
+  --combo-id ID            Stable id linking baseline+churn rows (default: \$RUN_ID).
+  --run-id ID              Reuse a prior run_id (default: fresh timestamp).
+  --churn-rate N           Deployment scale operations per second (required).
+  --duration SEC           Fortio + churn duration (default: $DURATION).
+  --qps N                  Target QPS (default: $QPS).
+  --connections N          Concurrent connections (default: $CONNECTIONS).
+  --settle-sec N           Settle delay before measurement starts (default: $SETTLE_SEC).
+  --deployment-count N     Churn-target Deployments to operate on (default: $CHURN_DEPLOYMENT_COUNT_OPT).
+  --base-replicas N        Replicas value for "scale-down" operations (default: $CHURN_BASE_REPLICAS_OPT).
+  --scale-to N             Replicas value for "scale-up" operations, above --base-replicas
+                           (default: $CHURN_SCALE_TO_OPT).
+  --seed N                 Seed for the deterministic churn order (default: $CHURN_SEED).
+  --output-file FILE       TSV file to append to (must already have header).
+  --output-dir DIR         Default results dir if --output-file not given.
+  --baseline-file FILE     Optional baseline TSV used to compute Δp99 vs same combo_id.
+  --tuning-baseline STR    Tuning levers for the preamble (default: unknown; a sweep sets it).
+  --sidecar-egress-hosts STR  Root Sidecar egress hosts for the preamble (default: unknown;
+                           a sweep sets it).
+  --dry-run                Print plan only.
+  -h, --help               Show this help.
+
+Environment (config/options.env describes each): the flags' COEXEC_* and CHURN_* keys,
+COEXEC_MIN_PCT_200 (ERROR_RATE_HIGH below it; default $MIN_PCT_200, 0 = off),
+COEXEC_TEST_NAMESPACE, COEXEC_ISTIOD_REPLICAS, COEXEC_RESULTS_DIR (relative to the repo
+root), REACH_* (recorded in a TSV it starts), FANOUT_* (FANOUT_MAX_SKEW_MS: POISONED_SCRAPE
+above it), METRICS_SCRAPE_TIMEOUT, ISTIOD_DIAG_*, TEST_PLATFORM, PLATFORM_READ_TIMEOUT,
+PLATFORM_READ_PARALLEL. Environment only: ISTIO_VERSION_CHECK, ISTIO_VERSION_READY_WAIT_SEC.
+
+Exit codes: 0 the row was written (or the plan shown); 1 an error.
+
+See tests/churn-dataplane/README.md.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--config)
+		# Loaded by config_preload above.
+		[[ -n "${2:-}" ]] || die "--config requires a value"
+		shift 2 ;;
+	--source-context)
+		[[ -n "${2:-}" ]] || die "--source-context requires a value"
+		SOURCE_CTX="$2"; shift 2 ;;
+	--remote-contexts)
+		[[ -n "${2:-}" ]] || die "--remote-contexts requires a value"
+		REMOTE_CONTEXTS_CSV="$2"; shift 2 ;;
+	--mesh-size)
+		[[ -n "${2:-}" ]] || die "--mesh-size requires a value"
+		MESH_SIZE="$2"; shift 2 ;;
+	--combo-id)
+		[[ -n "${2:-}" ]] || die "--combo-id requires a value"
+		COMBO_ID="$2"; shift 2 ;;
+	--run-id)
+		[[ -n "${2:-}" ]] || die "--run-id requires a value"
+		RUN_ID_OPT="$2"; shift 2 ;;
+	--churn-rate)
+		[[ -n "${2:-}" ]] || die "--churn-rate requires a value"
+		CHURN_RATE="$2"; shift 2 ;;
+	--duration)
+		[[ -n "${2:-}" ]] || die "--duration requires a value"
+		DURATION="$2"; shift 2 ;;
+	--qps)
+		[[ -n "${2:-}" ]] || die "--qps requires a value"
+		QPS="$2"; shift 2 ;;
+	--connections)
+		[[ -n "${2:-}" ]] || die "--connections requires a value"
+		CONNECTIONS="$2"; shift 2 ;;
+	--settle-sec)
+		[[ -n "${2:-}" ]] || die "--settle-sec requires a value"
+		SETTLE_SEC="$2"; shift 2 ;;
+	--deployment-count)
+		[[ -n "${2:-}" ]] || die "--deployment-count requires a value"
+		CHURN_DEPLOYMENT_COUNT_OPT="$2"; shift 2 ;;
+	--base-replicas)
+		[[ -n "${2:-}" ]] || die "--base-replicas requires a value"
+		CHURN_BASE_REPLICAS_OPT="$2"; shift 2 ;;
+	--scale-to)
+		[[ -n "${2:-}" ]] || die "--scale-to requires a value"
+		CHURN_SCALE_TO_OPT="$2"; shift 2 ;;
+	--seed)
+		[[ -n "${2:-}" ]] || die "--seed requires a value"
+		CHURN_SEED="$2"; shift 2 ;;
+	--output-file)
+		[[ -n "${2:-}" ]] || die "--output-file requires a value"
+		OUTPUT_FILE="$2"; shift 2 ;;
+	--output-dir)
+		[[ -n "${2:-}" ]] || die "--output-dir requires a value"
+		OUTPUT_DIR="$2"; shift 2 ;;
+	--baseline-file)
+		[[ -n "${2:-}" ]] || die "--baseline-file requires a value"
+		BASELINE_FILE="$2"; shift 2 ;;
+	--tuning-baseline)
+		[[ -n "${2:-}" ]] || die "--tuning-baseline requires a value"
+		TUNING_BASELINE="$2"; shift 2 ;;
+	--sidecar-egress-hosts)
+		[[ -n "${2:-}" ]] || die "--sidecar-egress-hosts requires a value"
+		SIDECAR_EGRESS_HOSTS="$2"; shift 2 ;;
+	--dry-run)
+		DRY_RUN=1; shift ;;
+	-h | --help)
+		usage; exit 0 ;;
+	*)
+		die "unknown option: $1 (try --help)" ;;
+	esac
+done
+
+platform_validate
+[[ -n "$SOURCE_CTX" ]] || die "--source-context is required"
+[[ -n "$CHURN_RATE" ]] || die "--churn-rate is required"
+[[ "$CHURN_RATE" =~ ^[0-9]+$ ]] || die "--churn-rate must be a non-negative integer"
+is_pos_int "$DURATION" || die "--duration (or COEXEC_CHURN_DURATION_SEC) must be a positive integer; got '$DURATION'"
+is_pos_int "$QPS" || die "--qps (or COEXEC_QPS) must be a positive integer; got '$QPS'"
+is_pos_int "$CONNECTIONS" || die "--connections (or COEXEC_NUM_CONNECTIONS) must be a positive integer; got '$CONNECTIONS'"
+is_nonneg_int "$SETTLE_SEC" || die "--settle-sec (or COEXEC_SETTLE_SEC) must be a non-negative integer; got '$SETTLE_SEC'"
+is_nonneg_int "$CHURN_SEED" || die "--seed (or COEXEC_CHURN_SEED) must be a non-negative integer; got '$CHURN_SEED'"
+is_pos_int "$CHURN_DEPLOYMENT_COUNT_OPT" || die "--deployment-count must be a positive integer"
+is_nonneg_int "$CHURN_BASE_REPLICAS_OPT" || die "--base-replicas must be a non-negative integer"
+is_pos_int "$CHURN_SCALE_TO_OPT" || die "--scale-to must be a positive integer"
+# Otherwise the parity toggle scales every Deployment to the count it already has: no
+# churn, and the rows still read OK (as tests/churn).
+((CHURN_SCALE_TO_OPT > CHURN_BASE_REPLICAS_OPT)) \
+	|| die "--scale-to ($CHURN_SCALE_TO_OPT) must be greater than --base-replicas ($CHURN_BASE_REPLICAS_OPT)"
+is_ratio "$MIN_PCT_200" || [[ "$MIN_PCT_200" =~ ^0(\.0+)?$ ]] \
+	|| die "COEXEC_MIN_PCT_200 must be 0 (rule off) or a decimal in (0,1]; got '$MIN_PCT_200'"
+
+KUBECTL=()
+resolve_kubectl KUBECTL
+command -v jq >/dev/null 2>&1 || die "jq not found on PATH"
+command -v curl >/dev/null 2>&1 || die "curl not found on PATH"
+
+REMOTES=()
+[[ -n "$REMOTE_CONTEXTS_CSV" ]] && split_contexts "$REMOTE_CONTEXTS_CSV" REMOTES --remote-contexts "$SOURCE_CTX"
+# The source and its remotes, each under a name of its own in the platform record
+# (platform_members_check): refused here, before any cluster call, in a --dry-run too.
+platform_members_check "$SOURCE_CTX" ${REMOTES[@]+"${REMOTES[@]}"}
+[[ -z "$MESH_SIZE" ]] && MESH_SIZE=$(( 1 + ${#REMOTES[@]} ))
+
+RUN_ID="${RUN_ID_OPT:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+[[ -z "$COMBO_ID" ]] && COMBO_ID="$RUN_ID"
+
+[[ -z "$OUTPUT_FILE" ]] && OUTPUT_FILE="${OUTPUT_DIR}/churn-dataplane-${RUN_ID}.tsv"
+
+HARNESS_SHA="$(harness_sha --exclude "$(dirname "$OUTPUT_FILE")")"
+ALL_CTXS=("$SOURCE_CTX" ${REMOTES[@]+"${REMOTES[@]}"})
+
+if ((DRY_RUN)); then
+	echo "=== Dry-run: churn probe ==="
+	echo "Source: $SOURCE_CTX | Remotes: ${REMOTES[*]:-none} | Mesh size: $MESH_SIZE"
+	echo "Churn rate: ${CHURN_RATE}/s | Duration: ${DURATION}s | Deployments: $CHURN_DEPLOYMENT_COUNT_OPT"
+	echo "Replicas: ${CHURN_BASE_REPLICAS_OPT} <-> ${CHURN_SCALE_TO_OPT} | Seed: $CHURN_SEED"
+	echo "Output: $OUTPUT_FILE  Baseline: ${BASELINE_FILE:-none}"
+	echo "RUN_ID=$RUN_ID  COMBO_ID=$COMBO_ID  HARNESS_SHA=$HARNESS_SHA"
+	echo "Min pct_200: $MIN_PCT_200 (ERROR_RATE_HIGH below it; 0 = off)"
+	exit 0
+fi
+mkdir -p "$(dirname "$OUTPUT_FILE")"
+
+# Preflight + record the source istiod replica count (PL2). The fanout
+# (tests/lib/fanout.sh) scrapes EVERY Running istiod pod, so multi-replica
+# istiod is supported; we just require >= 1 pod and record provenance. Warn (do
+# not die) if the count differs from the expected pin COEXEC_ISTIOD_REPLICAS.
+SOURCE_REPLICAS="$(fanout_preflight_istiod "$SOURCE_CTX" "${KUBECTL[@]}")"
+if [[ -n "${COEXEC_ISTIOD_REPLICAS:-}" && "$SOURCE_REPLICAS" != "$COEXEC_ISTIOD_REPLICAS" ]]; then
+	echo "warn: context $SOURCE_CTX has $SOURCE_REPLICAS Running istiod pods, expected pin COEXEC_ISTIOD_REPLICAS=$COEXEC_ISTIOD_REPLICAS" >&2
+fi
+
+# The Istio version the members run, before any load or churn (inherited when 004
+# runs this probe; read here when it runs alone). ISTIO_VERSION_CHECK=fail stops on a
+# mismatch.
+ALL_CTXS_CSV="$SOURCE_CTX"
+for r in ${REMOTES[@]+"${REMOTES[@]}"}; do ALL_CTXS_CSV+=",$r"; done
+istio_version_resolve "$ALL_CTXS_CSV" 0 "${KUBECTL[@]}"
+mapfile -t IV_KV < <(istio_version_kv)
+
+# Bootstrap output file if missing.
+if [[ ! -f "$OUTPUT_FILE" ]]; then
+	KUBE_VERSIONS_CSV="$(probe_kube_versions "$ALL_CTXS_CSV" "${KUBECTL[@]}")"
+	# The platform record (tests/lib/platform.sh), before the window: inherited, else read here.
+	platform_probe "$ALL_CTXS_CSV"
+	write_preamble "churn-dataplane co-exec test" "$OUTPUT_FILE" \
+		"RUN_ID=$RUN_ID" \
+		"HARNESS_SHA=$HARNESS_SHA" \
+		"${IV_KV[@]}" \
+		"KUBE_VERSIONS=$KUBE_VERSIONS_CSV" \
+		"TUNING_BASELINE=$TUNING_BASELINE" \
+		"SIDECAR_EGRESS_HOSTS=$SIDECAR_EGRESS_HOSTS" \
+		"ISTIOD_REPLICAS=$SOURCE_REPLICAS" \
+		"SETTLE_SEC=$SETTLE_SEC" \
+		"BASELINE_DURATION_SEC=${COEXEC_BASELINE_DURATION_SEC:-$DURATION}" \
+		"CHURN_DURATION_SEC=$DURATION" \
+		"QPS=$QPS" \
+		"CONNECTIONS=$CONNECTIONS" \
+		"NAMESPACE=$NS" \
+		"FANOUT_MAX_SKEW_MS=$FANOUT_MAX_SKEW_MS" \
+		"FANOUT_METRICS_TIMEOUT=$FANOUT_METRICS_TIMEOUT" \
+		"MIN_PCT_200=$MIN_PCT_200" \
+		"REACH_REQUESTS=$REACH_REQUESTS" \
+		"REACH_QPS=${REACH_QPS:-10}" \
+		"REACH_HTTP_TIMEOUT_SEC=${REACH_HTTP_TIMEOUT_SEC:-3}" \
+		"REACH_DETAIL_TIMEOUT_SEC=${REACH_DETAIL_TIMEOUT_SEC:-35}" \
+		"REACH_ATTEMPTS=${REACH_ATTEMPTS:-3}" \
+		"REACH_RETRY_SEC=${REACH_RETRY_SEC:-10}" \
+		"ON_UNREACHABLE=$ON_UNREACHABLE"
+	{ config_preamble_lines; platform_preamble_lines "$ALL_CTXS_CSV"; } >> "$OUTPUT_FILE"
+	printf 'run_id\tharness_sha\tcombo_id\tmesh_size\tchurn_rate\tphase\tduration_s\tqps_target\tqps_actual\tp50_ms\tp90_ms\tp99_ms\tp999_ms\tmax_ms\tdelta_p99_ms\tistiod_restarted\tstatus\tchurn_ops_attempted\tchurn_ops_succeeded\txds_pushes_delta\teds_pushes_delta\tpush_triggers_delta\tconvergence_p99_ms\tqueue_time_p99_ms\tpush_time_p99_ms\n' >> "$OUTPUT_FILE"
+fi
+
+CLIENT_POD="$(fortio_client_pod "$SOURCE_CTX" "$NS" fortio-client "${KUBECTL[@]}")" \
+	|| die "no Ready fortio-client pod that is not being deleted on $SOURCE_CTX (ns=$NS): run 001, or wait until its Deployment's new pod is Ready"
+
+# PL16: deterministic seeded shuffle of churn-target indices [0, N).
+# Implemented in awk with a linear congruential generator so we don't depend on
+# `shuf` (which honors LC_ALL inconsistently and isn't always installed).
+seeded_shuffle() {
+	local n="$1" seed="$2"
+	awk -v n="$n" -v seed="$seed" 'BEGIN {
+		for (i = 0; i < n; i++) a[i] = i
+		state = (seed * 1103515245 + 12345) % 2147483648
+		for (i = n - 1; i > 0; i--) {
+			state = (state * 1103515245 + 12345) % 2147483648
+			j = state % (i + 1)
+			tmp = a[i]; a[i] = a[j]; a[j] = tmp
+		}
+		for (i = 0; i < n; i++) printf "%d\n", a[i]
+	}'
+}
+
+mapfile -t SHUFFLED_INDICES < <(seeded_shuffle "$CHURN_DEPLOYMENT_COUNT_OPT" "$CHURN_SEED")
+
+# Per-index parity tracker (0=base, 1=scaled-up). Initial state: all at base.
+declare -a PARITY=()
+for ((i = 0; i < CHURN_DEPLOYMENT_COUNT_OPT; i++)); do PARITY[i]=0; done
+
+# Fan out a port-forward to EVERY Running istiod pod on the source context
+# (tests/lib/fanout.sh) for restart-detection scrapes; source context = ctx 0.
+PF_PIDS=()
+DRIVER_PID=""
+ISTIOD_PORTS=()
+ISTIOD_PODS=()
+ISTIOD_DIR="$(mktemp -d)"
+PF_OK=0
+# LOAD_POD: the client pod while the window's `fortio load` runs in it; the EXIT trap stops
+# a load still running there (fortio_client_stop).
+LOAD_POD=""
+cleanup_all() {
+	[[ -z "${LOAD_POD:-}" ]] || fortio_client_stop "$SOURCE_CTX" "$NS" "$LOAD_POD" "${KUBECTL[@]}"
+	if [[ -n "$DRIVER_PID" ]]; then kill "$DRIVER_PID" 2>/dev/null || true; wait "$DRIVER_PID" 2>/dev/null || true; fi
+	for pid in ${PF_PIDS[@]+"${PF_PIDS[@]}"}; do kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done
+	PF_PIDS=()
+	rm -rf "${ISTIOD_DIR:-}"
+	rm -f "${CHURN_LOG:-}"
+}
+trap cleanup_all EXIT
+
+# fanout_open dies if no istiod pod's /metrics becomes reachable; the istiod-side
+# restart detection and xDS deltas depend on it.
+fanout_open "$SOURCE_CTX" 0 PF_PIDS ISTIOD_PORTS ISTIOD_PODS "${KUBECTL[@]}"
+PF_OK=1
+
+PRE_PODSET="${ISTIOD_DIR}/pre.podset"
+PRE_SKEW_MS=0
+SCRAPE_INCOMPLETE=0
+if ((PF_OK)); then
+	# Pre podset = the pods fanout_open reached, in scrape-file order, so
+	# fanout_restart_status pairs each pod with its own scrape. The post podset
+	# lists every Running pod, so a replaced or added istiod shows as a change.
+	printf '%s\n' ${ISTIOD_PODS[@]+"${ISTIOD_PODS[@]}"} > "$PRE_PODSET"
+	PRE_SKEW_MS="$(fanout_scrape_all "$ISTIOD_DIR" "pre" ${ISTIOD_PORTS[@]+"${ISTIOD_PORTS[@]}"})"
+	(( $(fanout_scrape_failed_count "$ISTIOD_DIR" "pre") > 0 )) && SCRAPE_INCOMPLETE=1
+fi
+pre_metrics_csv() {
+	local i out=""
+	for i in "${!ISTIOD_PODS[@]}"; do
+		[[ -n "$out" ]] && out+=","
+		out+="${ISTIOD_DIR}/pre-${i}.metrics"
+	done
+	echo "$out"
+}
+
+echo "=== Churn phase ==="
+echo "Source: $SOURCE_CTX (pod: $CLIENT_POD) | Remotes: ${REMOTES[*]:-none}"
+echo "QPS=$QPS  Duration=${DURATION}s  Connections=$CONNECTIONS"
+echo "Churn rate: ${CHURN_RATE}/s  Deployments: $CHURN_DEPLOYMENT_COUNT_OPT  Replicas: ${CHURN_BASE_REPLICAS_OPT}<->${CHURN_SCALE_TO_OPT}"
+
+# PL3: settle gap distinct from measurement window.
+echo "Settling for ${SETTLE_SEC}s..."
+sleep "$SETTLE_SEC"
+
+# Churn driver: in the background, issue exactly CHURN_RATE * DURATION scale
+# operations spaced 1/CHURN_RATE seconds apart. Toggles each chosen index
+# between base and scale-to replica counts on all contexts in parallel.
+#
+# Per-op log line format (tab-separated):
+#   <dispatch_unix_ns>\t<exit_status>\t<deployment_index>
+# where:
+#   - <dispatch_unix_ns> is the wall-clock at the moment the parallel
+#     `kubectl scale` fan-out is dispatched (BEFORE `wait`), not at op
+#     completion. This is what downstream consumers (and 005) must use to
+#     validate the achieved rate, otherwise apiserver/scheduler latency
+#     would conflate with scheduling drift.
+#   - <exit_status> is 0 on success, non-zero if any of the parallel kubectl
+#     scale invocations for this op returned non-zero (e.g. 429 from
+#     kube-apiserver). 005 uses this to compute churn_ops_succeeded.
+CHURN_LOG="$(mktemp)"
+run_churn_driver() {
+	local pos=0
+	local total_ops=$(( CHURN_RATE * DURATION ))
+	if ((CHURN_RATE <= 0)); then
+		# Avoid divide-by-zero when CHURN_RATE=0 (steady-mesh-but-still-in-churn-phase).
+		total_ops=0
+	fi
+	# Drift-compensated scheduling: rather than sleeping a fixed slice per op
+	# (which lets the kubectl scale + subshell-fork overhead silently bleed
+	# the effective rate below the target at high rates), we compute the
+	# absolute target wall-clock for each op against the loop start and sleep
+	# the residual. This keeps the long-run rate honest.
+	local period_ns=0
+	if ((CHURN_RATE > 0)); then
+		period_ns=$(( 1000000000 / CHURN_RATE ))
+	fi
+	local start_ns
+	start_ns="$(now_ns)"
+	local op idx replicas ctx exit_status pid rc dispatch_ns
+	local -a scale_pids
+	for ((op = 0; op < total_ops; op++)); do
+		idx="${SHUFFLED_INDICES[pos % ${#SHUFFLED_INDICES[@]}]}"
+		pos=$((pos + 1))
+		if (( PARITY[idx] == 0 )); then
+			replicas="$CHURN_SCALE_TO_OPT"
+			PARITY[idx]=1
+		else
+			replicas="$CHURN_BASE_REPLICAS_OPT"
+			PARITY[idx]=0
+		fi
+		# Capture dispatch wall-clock BEFORE the kubectl scale fan-out so the
+		# per-op timestamp reflects when the op was issued, not when its
+		# apiserver ACKs all completed. See header comment for rationale.
+		dispatch_ns="$(now_ns)"
+		scale_pids=()
+		for ctx in "${ALL_CTXS[@]}"; do
+			"${KUBECTL[@]}" --context="$ctx" -n "$NS" scale "deployment/churn-target-${idx}" \
+				--replicas="$replicas" >/dev/null 2>&1 &
+			scale_pids+=($!)
+		done
+		# Capture exit status for accounting: non-zero on any kube-apiserver
+		# 429 / connection error / not-found / etc. Without this the TSV reports
+		# wc -l of the log and overstates actual churn at high rates.
+		exit_status=0
+		for pid in ${scale_pids[@]+"${scale_pids[@]}"}; do
+			if wait "$pid"; then rc=0; else rc=$?; fi
+			(( rc != 0 )) && exit_status="$rc"
+		done
+		printf '%s\t%s\t%s\n' "$dispatch_ns" "$exit_status" "$idx" >> "$CHURN_LOG"
+		# Drift compensation: sleep until start_ns + (op+1) * period_ns.
+		if ((period_ns > 0)); then
+			local target_ns now_ns delta_ns
+			target_ns=$(( start_ns + (op + 1) * period_ns ))
+			now_ns="$(now_ns)"
+			delta_ns=$(( target_ns - now_ns ))
+			if (( delta_ns > 0 )); then
+				sleep "$(awk -v n="$delta_ns" 'BEGIN{printf "%.9f", n/1e9}')"
+			fi
+		fi
+	done
+}
+if ((CHURN_RATE > 100)); then
+	echo "warn: churn-rate ${CHURN_RATE} exceeds the practical ceiling (~100 ops/s); per-op subshell overhead may cause the driver to fall behind" >&2
+fi
+run_churn_driver &
+DRIVER_PID=$!
+
+TARGET_URL="http://fortio-server.${NS}.svc.cluster.local:${COEXEC_SERVICE_PORT:-8080}/echo"
+WINDOW_START_NS="$(now_ns)"
+JSON_OUT=""
+STATUS="OK"
+LOAD_POD="$CLIENT_POD"
+if JSON_OUT="$("${KUBECTL[@]}" --context="$SOURCE_CTX" -n "$NS" exec "$CLIENT_POD" -c fortio -- \
+	fortio load -qps "$QPS" -c "$CONNECTIONS" -t "${DURATION}s" -json - -quiet "$TARGET_URL" 2>/dev/null)"; then
+	LOAD_POD=""
+else
+	STATUS="FAILED"
+	JSON_OUT=""
+fi
+WINDOW_END_NS="$(now_ns)"
+
+# Stop the churn driver. Only SIGTERM if fortio exited EARLY (before DURATION
+# elapsed); otherwise the driver has finished its CHURN_RATE * DURATION ops
+# and is about to return on its own — `wait` lets it flush its final per-op
+# accounting write to $CHURN_LOG. Killing mid-`wait` on the scale fan-out
+# could otherwise bias churn_ops_attempted/succeeded low by up to one op.
+ELAPSED_NS=$(( WINDOW_END_NS - WINDOW_START_NS ))
+DURATION_NS=$(( DURATION * 1000000000 ))
+if [[ "$STATUS" == "FAILED" ]] || (( ELAPSED_NS < DURATION_NS )); then
+	kill "$DRIVER_PID" 2>/dev/null || true
+fi
+wait "$DRIVER_PID" 2>/dev/null || true
+DRIVER_PID=""
+# The load can outlive its failed exec in the pod: wait it out (after the driver stopped),
+# so the next combo's baseline (002) does not run beside it.
+if [[ "$STATUS" == FAILED ]]; then
+	fortio_load_wait_out "$WINDOW_START_NS" "$DURATION" "$SOURCE_CTX" "$NS" "$CLIENT_POD" "${KUBECTL[@]}"
+fi
+LOAD_POD=""
+
+POST_PODSET="${ISTIOD_DIR}/post.podset"
+POST_SKEW_MS=0
+if ((PF_OK)); then
+	fanout_record_podset "$SOURCE_CTX" "$POST_PODSET" "${KUBECTL[@]}"
+	POST_SKEW_MS="$(fanout_scrape_all "$ISTIOD_DIR" "post" ${ISTIOD_PORTS[@]+"${ISTIOD_PORTS[@]}"})"
+	(( $(fanout_scrape_failed_count "$ISTIOD_DIR" "post") > 0 )) && SCRAPE_INCOMPLETE=1
+fi
+# PL8: per-window scrape skew now spans pods (max of pre/post batches).
+SCRAPE_SKEW_MS="$PRE_SKEW_MS"
+(( POST_SKEW_MS > SCRAPE_SKEW_MS )) && SCRAPE_SKEW_MS="$POST_SKEW_MS"
+# O3 (symmetry with propagation): a wide scrape skew means the pre/post per-pod
+# bodies were read seconds apart, so the istiod-side counter/histogram deltas are
+# computed across an incoherent snapshot. Fold it into SCRAPE_INCOMPLETE so the
+# row is tagged POISONED_SCRAPE; the raw skew is still emitted in the marker line.
+if (( SCRAPE_SKEW_MS > FANOUT_MAX_SKEW_MS )); then
+	SCRAPE_INCOMPLETE=1
+	echo "Warning: scrape_skew=${SCRAPE_SKEW_MS}ms exceeds FANOUT_MAX_SKEW_MS=${FANOUT_MAX_SKEW_MS}ms — row will be tagged POISONED_SCRAPE" >&2
+fi
+post_metrics_csv() {
+	local i out=""
+	for i in "${!ISTIOD_PODS[@]}"; do
+		[[ -n "$out" ]] && out+=","
+		out+="${ISTIOD_DIR}/post-${i}.metrics"
+	done
+	echo "$out"
+}
+
+# PL9 (widened): restart on per-pod start-time advance OR pod-set change.
+RESTARTED="unknown"
+PRE_FILES=(); POST_FILES=()
+if ((PF_OK)); then
+	for i in "${!ISTIOD_PODS[@]}"; do
+		PRE_FILES+=("${ISTIOD_DIR}/pre-${i}.metrics")
+		POST_FILES+=("${ISTIOD_DIR}/post-${i}.metrics")
+	done
+	RESTARTED="$(fanout_restart_status "$PRE_PODSET" "$POST_PODSET" \
+		"$(pre_metrics_csv)" "$(post_metrics_csv)")"
+fi
+
+# churn-ops accounting. The driver log has one line per attempted op,
+# each tab-prefixed with the exit status of the kubectl scale fan-out.
+CHURN_OPS_ATTEMPTED="$(wc -l < "$CHURN_LOG" 2>/dev/null || echo 0)"
+CHURN_OPS_ATTEMPTED="${CHURN_OPS_ATTEMPTED// /}"
+CHURN_OPS_SUCCEEDED="$(awk -F'\t' '$2 == "0" { c++ } END { print c + 0 }' "$CHURN_LOG" 2>/dev/null || echo 0)"
+rm -f "$CHURN_LOG"
+
+# Extract istiod-side xDS metrics by SUMMING counters across pods (each event is
+# emitted by exactly one replica) and MERGING histogram buckets across pods (PL11)
+# before the delta/quantile.
+XDS_PUSHES_DELTA="N/A"; EDS_PUSHES_DELTA="N/A"; PUSH_TRIGGERS_DELTA="N/A"
+CONVERGENCE_P99="N/A"; QUEUE_TIME_P99="N/A"; PUSH_TIME_P99="N/A"
+# An incomplete scrape (a pod's /metrics unreachable) undercounts the summed
+# counters / merged histograms, so the istiod-side deltas are not trustworthy.
+if [[ "$RESTARTED" == "0" && ${#PRE_FILES[@]} -gt 0 && "$SCRAPE_INCOMPLETE" == "0" ]]; then
+	# counter_delta (metrics.sh): N/A with a warning when a counter is in neither
+	# scrape (renamed, never 0) or went backwards; one registered in the window counts from 0.
+	XDS_PUSHES_DELTA=$(counter_delta "$(fanout_counter_sum pilot_xds_pushes ${PRE_FILES[@]+"${PRE_FILES[@]}"})" \
+		"$(fanout_counter_sum pilot_xds_pushes ${POST_FILES[@]+"${POST_FILES[@]}"})" "pilot_xds_pushes on ${SOURCE_CTX}")
+	EDS_PUSHES_DELTA=$(counter_delta "$(fanout_counter_by_label_sum pilot_xds_pushes type eds ${PRE_FILES[@]+"${PRE_FILES[@]}"})" \
+		"$(fanout_counter_by_label_sum pilot_xds_pushes type eds ${POST_FILES[@]+"${POST_FILES[@]}"})" "pilot_xds_pushes{type=eds} on ${SOURCE_CTX}")
+	PUSH_TRIGGERS_DELTA=$(counter_delta "$(fanout_counter_sum pilot_push_triggers ${PRE_FILES[@]+"${PRE_FILES[@]}"})" \
+		"$(fanout_counter_sum pilot_push_triggers ${POST_FILES[@]+"${POST_FILES[@]}"})" "pilot_push_triggers on ${SOURCE_CTX}")
+
+	for h in pilot_proxy_convergence_time pilot_proxy_queue_time pilot_xds_push_time; do
+		fanout_merge_histogram "$h" "${ISTIOD_DIR}/pre-${h}.merged" ${PRE_FILES[@]+"${PRE_FILES[@]}"}
+		fanout_merge_histogram "$h" "${ISTIOD_DIR}/post-${h}.merged" ${POST_FILES[@]+"${POST_FILES[@]}"}
+	done
+	CONVERGENCE_P99=$(delta_histogram_p99 "${ISTIOD_DIR}/pre-pilot_proxy_convergence_time.merged" "${ISTIOD_DIR}/post-pilot_proxy_convergence_time.merged" pilot_proxy_convergence_time)
+	QUEUE_TIME_P99=$(delta_histogram_p99 "${ISTIOD_DIR}/pre-pilot_proxy_queue_time.merged" "${ISTIOD_DIR}/post-pilot_proxy_queue_time.merged" pilot_proxy_queue_time)
+	PUSH_TIME_P99=$(delta_histogram_p99 "${ISTIOD_DIR}/pre-pilot_xds_push_time.merged" "${ISTIOD_DIR}/post-pilot_xds_push_time.merged" pilot_xds_push_time)
+fi
+
+QPS_ACTUAL="N/A"; P50="N/A"; P90="N/A"; P99="N/A"; P999="N/A"; MAX_LAT="N/A"
+if [[ "$STATUS" == "OK" && -n "$JSON_OUT" ]]; then
+	QPS_ACTUAL="$(printf '%s' "$JSON_OUT" | jq -r '.ActualQPS // empty' 2>/dev/null)"
+	[[ -z "$QPS_ACTUAL" ]] && QPS_ACTUAL="N/A"
+	P50="$(printf '%s' "$JSON_OUT"  | jq -r '(.DurationHistogram.Percentiles[]? | select(.Percentile == 50)   | .Value * 1000) // empty' 2>/dev/null)"
+	[[ -z "$P50" ]] && P50="N/A"
+	P90="$(printf '%s' "$JSON_OUT"  | jq -r '(.DurationHistogram.Percentiles[]? | select(.Percentile == 90)   | .Value * 1000) // empty' 2>/dev/null)"
+	[[ -z "$P90" ]] && P90="N/A"
+	P99="$(printf '%s' "$JSON_OUT"  | jq -r '(.DurationHistogram.Percentiles[]? | select(.Percentile == 99)   | .Value * 1000) // empty' 2>/dev/null)"
+	[[ -z "$P99" ]] && P99="N/A"
+	P999="$(printf '%s' "$JSON_OUT" | jq -r '(.DurationHistogram.Percentiles[]? | select(.Percentile == 99.9) | .Value * 1000) // empty' 2>/dev/null)"
+	[[ -z "$P999" ]] && P999="N/A"
+	MAX_LAT="$(printf '%s' "$JSON_OUT" | jq -r '(.DurationHistogram.Max // empty) * 1000' 2>/dev/null)"
+	[[ -z "$MAX_LAT" ]] && MAX_LAT="N/A"
+	# Error rate (tests/lib/fortio.sh; QPS-shortfall check off), same rule as 002.
+	if ! [[ "$MIN_PCT_200" =~ ^0(\.0+)?$ ]]; then
+		FORTIO_STATUS="$(fortio_row_status "$JSON_OUT" "$QPS" 0 "$MIN_PCT_200")"
+		[[ "$FORTIO_STATUS" == OK ]] || STATUS="$FORTIO_STATUS"
+	fi
+fi
+# pct_200 / top_code for the marker comment ("N/A" / "-" without a fortio result).
+read -r _ok _total PCT_200 TOP_CODE <<<"$(reach_summarize "$JSON_OUT")"
+
+# PL13: istiod restarted (or unknown) -> emit N/A for derived quantiles
+# and istiod counter/histogram deltas.
+if [[ "$RESTARTED" != "0" ]]; then
+	P50="N/A"; P90="N/A"; P99="N/A"; P999="N/A"; MAX_LAT="N/A"
+	XDS_PUSHES_DELTA="N/A"; EDS_PUSHES_DELTA="N/A"; PUSH_TRIGGERS_DELTA="N/A"
+	CONVERGENCE_P99="N/A"; QUEUE_TIME_P99="N/A"; PUSH_TIME_P99="N/A"
+	[[ "$STATUS" == "OK" ]] && STATUS="POISONED_RESTART"
+fi
+# A pod's /metrics was unreachable -> istiod-side aggregation undercounted; tag
+# the row so 005 filters it (a non-OK status the aggregator drops).
+if [[ "$SCRAPE_INCOMPLETE" == "1" && "$STATUS" == "OK" ]]; then
+	STATUS="POISONED_SCRAPE"
+fi
+
+# If the driver could not keep up (e.g. apiserver 429s), mark the row so
+# 005 filters it from numeric aggregation. Threshold matches the spec (<90%).
+# Skip this check when CHURN_RATE=0 (no ops are expected).
+if (( CHURN_RATE > 0 )) && (( CHURN_OPS_ATTEMPTED > 0 )); then
+	if awk -v s="$CHURN_OPS_SUCCEEDED" -v a="$CHURN_OPS_ATTEMPTED" \
+		'BEGIN { exit !(s/a < 0.9) }'; then
+		# Don't overwrite POISONED_RESTART or FAILED — those signal a worse problem.
+		[[ "$STATUS" == "OK" ]] && STATUS="CHURN_RATE_NOT_MET"
+	fi
+fi
+
+# Δp99: look up the matching baseline row in --baseline-file, by combo_id.
+# Gate on baseline status == "OK" (column 17). A baseline that ended in
+# POISONED_RESTART / FAILED has malformed (or N/A) p99 and the resulting
+# delta would be nonsense even if NF >= 17 and $12 != "N/A".
+DELTA_P99="N/A"
+if [[ -n "$BASELINE_FILE" && -f "$BASELINE_FILE" && "$P99" != "N/A" ]]; then
+	BASELINE_P99="$(awk -F'\t' -v combo="$COMBO_ID" '
+		!/^#/ && !/^run_id/ && NF >= 17 && $3 == combo && $6 == "baseline" && $17 == "OK" && $12 != "N/A" {
+			print $12; exit
+		}' "$BASELINE_FILE")"
+	if [[ -n "$BASELINE_P99" ]]; then
+		DELTA_P99="$(awk -v a="$P99" -v b="$BASELINE_P99" 'BEGIN { printf "%.2f\n", a - b }')"
+	fi
+fi
+
+printf "Result: phase=churn rate=%s/s ops_attempted=%s ops_succeeded=%s qps_actual=%s p50=%s p99=%s max=%s Δp99=%s pct_200=%s top_code=%s restarted=%s status=%s\n" \
+	"$CHURN_RATE" "$CHURN_OPS_ATTEMPTED" "$CHURN_OPS_SUCCEEDED" "$QPS_ACTUAL" "$P50" "$P99" "$MAX_LAT" "$DELTA_P99" "$PCT_200" "$TOP_CODE" "$RESTARTED" "$STATUS"
+printf "  istiod: xds_pushes=%s eds_pushes=%s triggers=%s conv_p99=%s queue_p99=%s push_time_p99=%s\n" \
+	"$XDS_PUSHES_DELTA" "$EDS_PUSHES_DELTA" "$PUSH_TRIGGERS_DELTA" "$CONVERGENCE_P99" "$QUEUE_TIME_P99" "$PUSH_TIME_P99"
+
+# PL8: scrape_skew_ms spans the fanned-out per-pod istiod scrapes (max of the
+# pre/post batch skews); recorded as a comment since the TSV schema is unchanged.
+printf '# combo=%s phase=churn window_start_ns=%s window_end_ns=%s churn_ops_attempted=%s churn_ops_succeeded=%s istiod_replicas=%s scrape_skew_ms=%s pct_200=%s top_code=%s\n' \
+	"$COMBO_ID" "$WINDOW_START_NS" "$WINDOW_END_NS" "$CHURN_OPS_ATTEMPTED" "$CHURN_OPS_SUCCEEDED" "${SOURCE_REPLICAS:-unknown}" "$SCRAPE_SKEW_MS" "$PCT_200" "$TOP_CODE" >> "$OUTPUT_FILE"
+
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+	"$RUN_ID" "$HARNESS_SHA" "$COMBO_ID" "$MESH_SIZE" "$CHURN_RATE" "churn" \
+	"$DURATION" "$QPS" "$QPS_ACTUAL" \
+	"$P50" "$P90" "$P99" "$P999" "$MAX_LAT" \
+	"$DELTA_P99" "$RESTARTED" "$STATUS" \
+	"$CHURN_OPS_ATTEMPTED" "$CHURN_OPS_SUCCEEDED" \
+	"$XDS_PUSHES_DELTA" "$EDS_PUSHES_DELTA" "$PUSH_TRIGGERS_DELTA" \
+	"$CONVERGENCE_P99" "$QUEUE_TIME_P99" "$PUSH_TIME_P99" >> "$OUTPUT_FILE"
+
+echo "Wrote churn row to $OUTPUT_FILE"
+
+# istiod restart evidence (tests/lib/istiod-diag.sh) after the row is written and before
+# the targets go back to base, into istiod-diag-<RUN_ID>/ next to the output TSV.
+# Best-effort: never changes the row or the exit status. Source context only.
+if [[ "$RESTARTED" != "0" ]]; then
+	istiod_diag_capture "$(istiod_diag_dir "$OUTPUT_FILE" "$RUN_ID")" "${COMBO_ID}-churn" "$SOURCE_CTX" \
+		"$RESTARTED" "$PRE_PODSET" "$(pre_metrics_csv)" "${KUBECTL[@]}"
+fi
+
+# The driver can leave targets at --scale-to (an odd number of toggles per target).
+# Put them back to base so a later baseline or churn window starts all-base.
+for ctx in "${ALL_CTXS[@]}"; do
+	"${KUBECTL[@]}" --context="$ctx" -n "$NS" --request-timeout=10s scale deployment \
+		-l churn-target=true --replicas="$CHURN_BASE_REPLICAS_OPT" >/dev/null \
+		|| echo "warn: could not reset churn targets to base on $ctx" >&2
+done

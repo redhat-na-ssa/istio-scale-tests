@@ -1,0 +1,41 @@
+# cert-manager operand namespace; the root CA Secret is stored here.
+namespace: cert-manager
+
+# Argo CD sync waves: RBAC, bootstrap issuer, root Certificate, root CA ClusterIssuer.
+argoSyncWaves:
+  enabled: true
+  rbac: -20
+  bootstrapIssuer: 0
+  rootCertificate: 1
+  rootClusterIssuer: 2
+
+# Lets the Argo CD application controller manage Certificates/Secrets in namespace
+# and ClusterIssuers.
+rbac:
+  enabled: true
+  argocd:
+    namespace: argocd
+    serviceAccountName: argocd-application-controller
+  labels: {}
+  annotations: {}
+
+bootstrapIssuer:
+  enabled: true
+  name: mesh-selfsigned-bootstrap
+
+rootCA:
+  enabled: true
+  certificateName: mesh-root-ca
+  secretName: mesh-root-ca-material
+  clusterIssuerName: mesh-root-ca
+  commonName: Istio Mesh Root CA
+  duration: 87600h
+  organization: Istio
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+
+# CA ClusterIssuer backed by the root Secret; signs the per-cluster intermediates
+# (charts/hub-mesh-ca-intermediate).
+rootClusterIssuer:
+  enabled: true

@@ -1,0 +1,18 @@
+istioNamespace: istio-system
+
+# Creates openshift-monitoring/cluster-monitoring-config with only
+# enableUserWorkload: true. Leave false if that ConfigMap already exists
+# (it holds other cluster monitoring settings); edit it instead.
+enableUserWorkloadMonitoring: false
+
+# Extra labels on the ServiceMonitor and the PrometheusRule, for a Prometheus that selects them
+# by label (kube-prometheus-stack: release: <its release name>).
+extraLabels: {}
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+
+prometheusRule:
+  enabled: true

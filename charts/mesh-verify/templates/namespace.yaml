@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespace }}
+  labels:
+    istio.io/rev: default
+    # mesh-verify is sidecar-injected (istio.io/rev above), so under the campaign
+    # baseline's discoverySelectors (spoke-ossm tuningBaseline.discoverySelectors)
+    # istiod must discover it or the verify workload never gets a proxy config.
+    istio-discovery: enabled

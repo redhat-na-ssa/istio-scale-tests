@@ -1,0 +1,63 @@
+# Editor settings
+/.vscode/settings.json
+# Editor swap and backup files, macOS Finder metadata (anywhere: a run's HARNESS_SHA
+# counts every untracked file under tests/, config/, charts/ and terraform/ that is not
+# ignored: harness_sha in tests/lib/common.sh)
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local campaign progress log (unredacted; never commit)
+/CAMPAIGN_STATUS.md
+
+# Private key and certificate material (beyond /cacerts/)
+*.pem
+*.key
+*.crt
+
+# Generated kubeconfig (terraform/rosa-hcp/kubeconfig)
+/terraform/rosa-hcp/kubeconfig
+
+# Environment files with potential secrets
+.env
+.env.local
+.env.*.local
+
+# Operator run configs (--config) with real context names
+/tests/*/configs/*.local.env
+
+# Reviewer-loop tooling (playwright headless smoke tests)
+/node_modules/
+/package-lock.json
+
+# Local tool binaries (e.g. a manually-downloaded istioctl for remote-clusters checks)
+/.bin/
+
+# Test results (TSV data, scraped metrics, reports)
+/tests/propagation/results/
+/tests/controlplane/results/
+/tests/dataplane/results/
+/tests/churn/results/
+/tests/churn-dataplane/results/
+/tests/tuning/results/
+/tests/campaign/results/
+/tests/campaign/profiles/*.local/
+/misc_tests/gateway-api/results/
+
+# Terraform — state, workspace data, local plugins (keep **/.terraform.lock.hcl tracked)
+/terraform/**/.terraform/
+/terraform/**/*.tfstate
+/terraform/**/*.tfstate.*
+/terraform/**/.terraform.tfstate.lock.info
+/terraform/**/terraform.tfstate.d/
+/terraform/**/*.tfplan
+/terraform/**/tfplan
+/terraform/**/crash.log
+/terraform/**/crash.*.log
+# tfvars and their JSON form anywhere (a copied rosa.tfvars at the repo root, *.auto.tfvars.json)
+*.tfvars
+*.tfvars.json
+!/terraform/**/*.tfvars.example
+# `terraform output -json by_cluster` (cluster API URLs, console URLs, account data)
+by_cluster*.json

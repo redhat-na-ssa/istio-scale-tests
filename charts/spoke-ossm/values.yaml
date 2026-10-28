@@ -1,0 +1,104 @@
+# Required. Set per cluster by the ApplicationSet; the network is "<clusterName>-<networkSuffix>".
+clusterName: ""
+meshID: mesh1
+networkSuffix: network
+# Keep in sync with ISTIO_VERSION in config/versions.env. Must be in the installed
+# operator's Istio version enum (Sail operator 1.31.1, pinned in
+# charts/gitops-hub-ocm-placement-appset/values-sail-operator.yaml, and OSSM stable-3.4
+# serve v1.30.5).
+istioVersion: v1.30.5
+
+# Sail profile of the Istio and IstioCNI CRs. values-openshift.yaml sets openshift.
+profile: default
+
+# The IstioCNI CR's spec.values, as is (Sail's CNIValues: cni.*, global.platform). The
+# default profile writes the CNI plugin to /opt/cni/bin and its config to /etc/cni/net.d;
+# a distribution that keeps them elsewhere needs its platform, e.g. on k3s:
+#   istioCni: {values: {global: {platform: k3s}}}
+istioCni:
+  values: {}
+
+# istiod sized for the 20-cluster / 10k-service campaign: fixed replicas (no HPA) and
+# Guaranteed QoS. Every replica caches the whole mesh, so extra replicas do not cut memory.
+# istiod sets GOMEMLIMIT to 90% of limits.memory. The defaults reserve 12 CPU / 48Gi.
+pilot:
+  autoscaleEnabled: false
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: "4"
+      memory: 16Gi
+    limits:
+      cpu: "4"
+      memory: 16Gi
+
+# Sidecar resources. Requests equal the Istio default;
+# limits are lower than the default (2 CPU / 1Gi).
+proxy:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+accessLogFile: /dev/stdout
+accessLogEncoding: JSON
+
+# Rendered into spec.values.global.meshNetworks only when non-empty.
+meshNetworks: {}
+
+# Campaign tuning baseline, on by default.
+tuningBaseline:
+  # discoverySelectors: istiod watches only namespaces that match a selector (OR'd).
+  # istio-system is not included automatically, so it is selected by name.
+  discoverySelectors:
+    enabled: true
+    selectors:
+      - matchLabels:
+          istio-discovery: "enabled"
+      - matchLabels:
+          kubernetes.io/metadata.name: istio-system
+
+  # A mesh-wide Sidecar in istio-system limits each sidecar proxy's egress. The gateways
+  # (router proxies) take no Sidecar and keep full egress (templates/tuning-sidecar.yaml).
+  sidecar:
+    enabled: true
+    # Namespace parts are exact matches, not globs. Every mesh namespace needs its own
+    # "<ns>/*" entry (e.g. controlplane-test-1/*) and the istio-discovery=enabled label.
+    egressHosts:
+      - "./*"
+      - "istio-system/*"
+      - "mesh-verify/*"
+      - "churn-test/*"
+      - "churn-dataplane-test/*"
+      - "controlplane-test/*"
+      - "dataplane-test/*"
+      - "propagation-test/*"
+
+  # Disable client-side request metrics.
+  telemetryFiltering:
+    enabled: true
+
+  # Access-log only server-side responses with code >= 400.
+  accessLogFiltering:
+    enabled: true
+
+# PreSync Job that holds the Istio CR until cacerts is pushed from the hub. It reads
+# only the Secret's metadata, with curl and the Job's ServiceAccount token.
+waitForCacerts:
+  enabled: true
+  timeoutSeconds: 1200
+  # Same curl image as the gateways' wait-for-istiod Jobs and mesh-wiring-verify.
+  image: docker.io/curlimages/curl:8.22.0
+  # The image's user (curl_user) is not numeric, so runAsNonRoot needs the UID.
+  # values-openshift.yaml clears it: OpenShift assigns one from the namespace range.
+  runAsUser: 100
+
+argoSyncWaves:
+  enabled: true
+  istioCni: "0"
+  istio: "5"
+  # After the Istio CR, so istiod is up before the Sidecar/Telemetry CRs.
+  tuning: "10"

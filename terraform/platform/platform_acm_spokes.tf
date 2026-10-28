@@ -1,0 +1,163 @@
+# --------------------------------------------------------------------------
+# ACM spoke registration — ManagedCluster + auto-import-secret (platform openshift;
+# on kubernetes the spokes are only Argo CD cluster Secrets, platform_gitops.tf)
+#
+# Uses the RHACM auto-import-secret approach instead of the manual
+# import.yaml extraction from the bash scripts. The ACM import controller
+# picks up the auto-import-secret and handles spoke registration.
+# --------------------------------------------------------------------------
+
+locals {
+  sorted_spoke_keys = sort(keys(local.spoke_cluster_keys))
+  mesh_member_spoke_keys = (
+    var.mesh_member_count == 0
+    ? local.sorted_spoke_keys
+    : slice(local.sorted_spoke_keys, 0, min(var.mesh_member_count, length(local.sorted_spoke_keys)))
+  )
+  mesh_member_spoke_set = toset(local.mesh_member_spoke_keys)
+}
+
+# --- ROSA mode: get bearer tokens via OAuth token script ---
+data "external" "spoke_token" {
+  for_each = local.use_kubeconfig ? {} : local.spoke_cluster_keys
+
+  program = [
+    "bash", "-c",
+    "TOKEN=$(\"$1\" \"$2\" \"$3\" \"$4\" | jq -r '.status.token') && jq -n --arg token \"$TOKEN\" '{\"token\":$token}'",
+    "--",
+    local.token_script,
+    local.by_cluster[each.key].cluster_api_url,
+    "cluster-admin",
+    local.admin_password,
+  ]
+}
+
+# --- Kubeconfig mode: extract minified kubeconfig per spoke ---
+data "external" "spoke_kubeconfig" {
+  for_each = local.use_kubeconfig && local.is_openshift ? local.spoke_cluster_keys : {}
+
+  program = [
+    "bash", "-c",
+    "KC=$(kubectl --kubeconfig \"$1\" config view --raw --minify --context \"$2\" --flatten 2>/dev/null) && jq -n --arg kc \"$KC\" '{\"kubeconfig\":$kc}'",
+    "--",
+    local.kubeconfig,
+    each.key,
+  ]
+}
+
+resource "kubernetes_manifest" "spoke_namespace" {
+  for_each = local.is_openshift ? local.spoke_cluster_keys : {}
+  provider = kubernetes.hub
+
+  manifest = {
+    apiVersion = "v1"
+    kind       = "Namespace"
+    metadata = {
+      name = each.key
+    }
+  }
+
+  computed_fields = ["metadata.labels", "metadata.annotations"]
+
+  field_manager {
+    name            = "terraform"
+    force_conflicts = true
+  }
+
+  depends_on = [time_sleep.wait_acm_ocm_webhook]
+}
+
+resource "helm_release" "acm_managed_cluster" {
+  for_each = local.is_openshift ? local.spoke_cluster_keys : {}
+  provider = helm.hub
+
+  name             = "acm-managed-cluster-${each.key}"
+  chart            = "${path.module}/../../charts/acm-managed-cluster"
+  namespace        = var.acm_namespace
+  create_namespace = false
+  take_ownership   = true
+  wait             = true
+  timeout          = 300
+
+  values = [yamlencode({ chartChecksum = local.chart_checksum["acm-managed-cluster"] })]
+
+  set = concat(
+    [
+      {
+        name  = "managedCluster.name"
+        value = each.key
+      },
+      {
+        name  = "clustersetName"
+        value = var.acm_cluster_set
+      },
+      {
+        name  = "managedCluster.clientConfigs[0].url"
+        value = local.by_cluster[each.key].cluster_api_url
+      },
+      {
+        name  = "managedServiceAccount.create"
+        value = tostring(var.enable_gitops)
+      },
+      {
+        name  = "managedServiceAccount.name"
+        value = var.gitops_managed_service_account_name
+      },
+      {
+        name  = "keepOnUninstall"
+        value = tostring(var.acm_keep_managed_clusters_on_destroy)
+      },
+    ],
+    contains(local.mesh_member_spoke_set, each.key) ? [
+      {
+        name  = "managedCluster.labels.istio-mesh-member"
+        value = "true"
+        type  = "string"
+      },
+    ] : [],
+  )
+
+  depends_on = [kubernetes_manifest.spoke_namespace]
+}
+
+# --- Auto-import secret: kubeconfig mode uses kubeConfig field, ROSA uses server+token ---
+resource "kubernetes_secret_v1" "auto_import" {
+  for_each = local.is_openshift ? local.spoke_cluster_keys : {}
+  provider = kubernetes.hub
+
+  metadata {
+    name      = "auto-import-secret"
+    namespace = each.key
+    # Without this the import controller deletes the Secret after a successful
+    # import and every later plan would recreate it.
+    annotations = {
+      "managedcluster-import-controller.open-cluster-management.io/keeping-auto-import-secret" = ""
+    }
+  }
+
+  data = (
+    local.use_kubeconfig
+    ? {
+      kubeconfig = data.external.spoke_kubeconfig[each.key].result.kubeconfig
+    }
+    : {
+      server = local.by_cluster[each.key].cluster_api_url
+      token  = data.external.spoke_token[each.key].result.token
+    }
+  )
+
+  type = "Opaque"
+
+  lifecycle {
+    ignore_changes = [data]
+  }
+
+  depends_on = [helm_release.acm_managed_cluster]
+}
+
+resource "time_sleep" "wait_spoke_registration" {
+  count = local.is_openshift && length(local.spoke_cluster_keys) > 0 ? 1 : 0
+
+  depends_on      = [kubernetes_secret_v1.auto_import]
+  create_duration = "300s"
+}

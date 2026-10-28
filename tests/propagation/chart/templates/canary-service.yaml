@@ -1,0 +1,21 @@
+{{- if .Values.backer.enabled }}
+# Selects the backer only while it carries the active label, so the Service has
+# zero endpoints until t0 and drains when the label is removed. Created once by
+# 001 and kept across probe iterations.
+apiVersion: v1
+kind: Service
+metadata:
+  name: propagation-canary
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "propagation-test.canary.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "propagation-test.canary.selectorLabels" . | nindent 4 }}
+    {{- include "propagation-test.canary.activeSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      protocol: TCP
+      targetPort: {{ .Values.service.port }}
+{{- end }}

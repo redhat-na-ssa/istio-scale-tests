@@ -1,0 +1,109 @@
+{{- if hasKey .Values.istiodCheck "host" }}
+{{- fail "istiodCheck.host was replaced by istiodCheck.service: the gate now reads every Ready istiod replica through the EndpointSlices of that Service in istioNamespace. Set istiodCheck.service to the Service's name (istiod for istiod.istio-system.svc) and remove istiodCheck.host." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mesh-wiring-verify
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "mesh-wiring-verify.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # The old pod goes first (maxSurge 0): a gate with the old member list beside the new one
+  # would name a member being added as a stale secret, or stay Ready on a list that no longer
+  # holds. (Still RollingUpdate: an apply that switched the type to Recreate would keep the
+  # live rollingUpdate defaults, which Recreate rejects.)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "mesh-wiring-verify.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mesh-wiring-verify.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccountName }}
+      containers:
+        - name: gate
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Idle main process; the readiness probe does the real work so the pod's
+          # Ready condition (and the owning Argo Application's health) tracks mesh
+          # wiring continuously.
+          command:
+            - /bin/sh
+            - -c
+            - 'trap "exit 0" TERM INT; while true; do sleep 3600 & wait $!; done'
+          env:
+            - name: ISTIO_NAMESPACE
+              value: {{ .Values.istioNamespace | quote }}
+            - name: EXPECTED_MEMBERS
+              value: {{ .Values.expectedMembers | quote }}
+            # The mesh members by name (comma-separated) and this member's own; empty: by count.
+            - name: EXPECTED_CLUSTERS
+              value: {{ include "mesh-wiring-verify.expectedClusters" . | quote }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.clusterName | default "" | toString | quote }}
+            - name: ISTIOD_CHECK_ENABLED
+              value: {{ .Values.istiodCheck.enabled | quote }}
+            - name: ISTIOD_SERVICE
+              value: {{ .Values.istiodCheck.service | quote }}
+            - name: ISTIOD_PORT
+              value: {{ .Values.istiodCheck.port | quote }}
+            - name: CURL_TIMEOUT
+              value: {{ .Values.istiodCheck.curlTimeoutSeconds | quote }}
+            - name: REQUIRE_REMOTE_SYNC
+              value: {{ .Values.istiodCheck.requireRemoteSync | quote }}
+            - name: EASTWEST_CHECK_ENABLED
+              value: {{ .Values.eastWestCheck.enabled | quote }}
+            - name: EASTWEST_SERVICE
+              value: {{ .Values.eastWestCheck.service | quote }}
+            # Inside the probe's timeout, so a slow API answers NotReady with a reason.
+            - name: CHECK_TIMEOUT
+              value: {{ max 1 (sub (int .Values.probe.timeoutSeconds) 2) | quote }}
+            # The check's files (each istiod replica's metric lines); the root filesystem is read-only.
+            - name: WORK_DIR
+              value: /work
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - /opt/check/readiness.sh
+            initialDelaySeconds: {{ .Values.probe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probe.periodSeconds }}
+            timeoutSeconds: {{ .Values.probe.timeoutSeconds }}
+            failureThreshold: {{ .Values.probe.failureThreshold }}
+            successThreshold: {{ .Values.probe.successThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: check
+              mountPath: /opt/check
+              readOnly: true
+            - name: work
+              mountPath: /work
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            {{- with .Values.runAsUser }}
+            runAsUser: {{ . }}
+            {{- end }}
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: check
+          configMap:
+            name: mesh-wiring-verify-check
+            defaultMode: 0555
+        - name: work
+          emptyDir:
+            sizeLimit: 16Mi

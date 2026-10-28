@@ -1,0 +1,28 @@
+# Preset: north-south ingress gateway on every mesh member.
+identity:
+  component: spoke-ingress-gateway
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-spoke-ingress-gw
+  roleBindingName: openshift-gitops-ocm-placement-spoke-ingress-gw
+
+argocdApplicationControllerRbac:
+  roleName: gitops-spoke-ingress-gateway-appset-argocd-sync
+  roleBindingName: gitops-spoke-ingress-gateway-appset-argocd-sync
+
+applicationSet:
+  name: spoke-ingress-gateway
+
+destination:
+  mode: clusterName
+  namespace: istio-system
+
+template:
+  applicationNameSuffix: ingress-gateway
+  source:
+    path: charts/spoke-ingress-gateway
+    helm:
+      releaseName: spoke-ingress-gateway
+      parameters:
+        - name: clusterName
+          value: "{{clusterName}}"

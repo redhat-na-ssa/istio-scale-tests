@@ -1,0 +1,26 @@
+# Preset, platform openshift: the Red Hat OSSM 3 (Sail) operator (OLM) on every mesh member.
+# On plain Kubernetes the upstream Sail operator is installed instead (values-sail-operator.yaml).
+identity:
+  component: spoke-ossm-operator
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-spoke-ossm-operator
+  roleBindingName: openshift-gitops-ocm-placement-spoke-ossm-operator
+
+argocdApplicationControllerRbac:
+  roleName: gitops-spoke-ossm-operator-appset-argocd-sync
+  roleBindingName: gitops-spoke-ossm-operator-appset-argocd-sync
+
+applicationSet:
+  name: spoke-ossm-operator
+
+destination:
+  mode: clusterName
+  namespace: openshift-operators
+
+template:
+  applicationNameSuffix: ossm-operator
+  source:
+    path: charts/spoke-ossm-operator
+    helm:
+      releaseName: spoke-ossm-operator

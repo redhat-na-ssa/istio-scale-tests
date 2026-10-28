@@ -1,0 +1,52 @@
+# Namespace for the SecretStore, ExternalSecret, output Secret and store ServiceAccount
+# (the ESO operand reconciles this namespace).
+namespace: external-secrets-operator
+
+# Namespace holding the Terraform-created Argo CD cluster Secrets (the Argo CD namespace).
+sourceSecretsNamespace: argocd
+
+# The member's Argo CD cluster name (set per cluster by the ApplicationSet).
+clusterName: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Source Secret is {clusterName}-{managedServiceAccountName}-cluster-secret unless
+# sourceSecretName is set; must match terraform var.gitops_managed_service_account_name.
+managedServiceAccountName: argocd-gitops
+sourceSecretName: ""
+
+# Output Secret (keys kubeconfig, bearer-token, ca.crt, client-cert, client-key);
+# defaults to kubeconfig-{clusterName}. Read on the hub by charts/hub-mesh-push-secrets.
+targetSecretName: ""
+
+# Short so credential changes reach the push-secrets chart quickly
+# (charts/mesh-wiring-verify reports missing wiring).
+refreshInterval: 5m
+
+# Hub API client settings for the kubernetes provider SecretStore.
+kubernetesAPI:
+  # Empty uses the ESO default (kubernetes.default.svc).
+  serverURL: ""
+  caFromConfigMap:
+    enabled: true
+    name: kube-root-ca.crt
+    key: ca.crt
+
+secretStoreName: ""
+serviceAccountName: ""
+
+# Lets the Argo CD application controller manage the ESO CRs and Secrets.
+rbac:
+  enabled: true
+  argocd:
+    namespace: argocd
+    serviceAccountName: argocd-application-controller
+  labels: {}
+  annotations: {}
+
+argoSyncWaves:
+  enabled: true
+  rbac: -30
+  secretStore: -25
+  externalSecret: 0
