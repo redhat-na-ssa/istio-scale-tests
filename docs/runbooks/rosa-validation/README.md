@@ -470,6 +470,17 @@ aws resourcegroupstaggingapi get-resources --tag-filters Key=purpose,Values=ossm
   - Checked before the apply by two independent reviews: every value fits on 2 nodes per member
     (no HPA, no PDB at 1 replica, no affinity in the repo's charts) and the tfvars reach the charts
     (the `spoke-ossm-appset` override deep-merges and keeps the rosa-mode ingress NLB default).
+  - The shared `cluster-admin` password cannot be rotated through Terraform on live clusters.
+    `terraform plan -replace=random_password.cluster_admin` shows the 4 clusters "updated in-place",
+    but the apply fails on each with `Attribute value cannot be changed` (the rhcs provider treats
+    `admin_credentials` as immutable) after it has already replaced the password in state and
+    deleted the kubeconfig. Recovery, done on 2026-10-29: copy the pre-apply
+    `terraform/rosa-hcp/terraform.tfstate.backup` (Terraform writes it once per command, before the
+    first state write) over `terraform.tfstate`, confirm its `random_password` matches the clusters'
+    `admin_credentials` and the platform state's remote-state copy (compare hashes, never print the
+    value), then `terraform plan` must show only the kubeconfig to create. A changed password needs
+    new clusters, or an OCM-side htpasswd change that breaks the kubeconfig and the platform's
+    Terraform access until the state is reconciled.
 
 ### How to drive it
 
