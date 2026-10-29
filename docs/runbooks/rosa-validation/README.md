@@ -8,16 +8,18 @@ status: current
 
 How to stand up the ROSA path end to end (`terraform/rosa-hcp`, then `terraform/platform` in rosa
 mode, then a mesh check), run one cost-capped validation window on it, and tear it all down again.
-**4 ROSA clusters exist since 2026-10-29 13:05 UTC (T0):** the OSSM functional mesh, hub
-`cluster-001` plus members `cluster-002` to `cluster-004` at the small functional sizing (Re-run,
-"Functional run"), applied from the session worktree
-`<repo>/.claude/worktrees/rosa-cluster-mesh-provision-8991bc` at `14218c4` (the first commit of
-the repo's new home, `redhat-na-ssa/istio-scale-tests`). **No auto-teardown is armed**, by the
-owner's choice: the owner tears it down by hand (Verify and recover, "Functional run teardown"),
-and it bills about $5.5/h until then. Its window files are in `~/.rosa-window/2026-10-29/`
-(`status.md` has the progress). October's month-to-date spend before it was $230.44, already above
-the `rosa-window-monthly` budget's $210, so that budget's ACTUAL alerts have fired and warn no
-more this month.
+**No ROSA clusters exist:** the 2026-10-29 OSSM functional mesh (hub `cluster-001` plus members
+`cluster-002` to `cluster-004` at the small functional sizing, Re-run "Functional run"; T0 13:05
+UTC; applied from the session worktree `<repo>/.claude/worktrees/rosa-cluster-mesh-provision-8991bc`
+at `14218c4`, the first commit of the repo's new home `redhat-na-ssa/istio-scale-tests`; no
+auto-teardown armed, by the owner's choice) was torn down at the owner's request with
+`003-auto-teardown.sh --now` from a clean teardown worktree (`CLEAN` 15:35 UTC, 24 min) and audited
+empty across all regions the same day; its platform `rosa` workspace was discarded. About $14 (an
+estimate: about 2 h 25 min at $5.5/h). It is to be rebuilt the same way to validate the Kiali and ACM
+Observability add-on (`docs/design/kiali-acm-multicluster.md`); the tfvars stay in that worktree.
+Its window files are in `~/.rosa-window/2026-10-29/` (`status.md`, `p9-audit.txt`). October's
+month-to-date spend before it was $230.44, already above the `rosa-window-monthly` budget's $210,
+so that budget's ACTUAL alerts had fired and warned no more that month.
 Before it, the 2026-10-27 campaign run (hub + 5 members, 6 clusters, the
 campaign runner's `rosa` profile, T0 12:16 UTC; record
 [`docs/campaigns/2026-10-27-rosa-hcp-5-member/`](../../campaigns/2026-10-27-rosa-hcp-5-member/README.md))
@@ -71,11 +73,19 @@ audited empty on <date>".
   no lab state, so no ROSA command there can touch the lab. Since 2026-10-28 the repo lives at
   `redhat-na-ssa/istio-scale-tests` with a fresh history (first commit `14218c4`); the old window
   commits are not in it.
-- Current run (2026-10-29, OSSM functional mesh):
+- The 2026-10-29 run (OSSM functional mesh; destroyed and audited empty the same day):
   - Worktree: `<repo>/.claude/worktrees/rosa-cluster-mesh-provision-8991bc` (branch
-    `claude/rosa-cluster-mesh-provision-8991bc`, HEAD `14218c4`). Its Terraform state and
-    kubeconfig are gitignored, so the worktree looks clean to git: do not remove or archive it
-    before the teardown audit is empty.
+    `claude/rosa-cluster-mesh-provision-8991bc`). Its Terraform state and kubeconfig are
+    gitignored, so the worktree looks clean to git: while clusters exist, do not remove or archive
+    it before the teardown audit is empty. Its `terraform.tfvars` and `rosa.tfvars` are kept there
+    for the rebuild.
+  - Teardown from a clean checkout when the run's worktree has Terraform edits in progress (on
+    2026-10-29 the Kiali add-on was being built in it): `git -C <repo> worktree add --detach <dir>
+    <last-applied-commit>`, move `terraform/rosa-hcp/{terraform.tfstate,terraform.tfstate.backup,kubeconfig}`
+    and `terraform/platform/terraform.tfstate.d/rosa/` there, copy both tfvars and `.terraform/`,
+    `terraform init` both roots, run `003-auto-teardown.sh --dry-run` and then `--now` from it,
+    discard its platform `rosa` workspace, and remove it once the audit is empty. A destroy reads
+    the configuration as well as the state, so half-edited `.tf` files can fail it midway.
   - State backups taken after each apply: `~/.rosa-window/2026-10-29/rosa-hcp.tfstate.backup`
     (and `platform-rosa.tfstate.backup` once the platform is applied), mode 0600. If the worktree
     is lost, restore them into a fresh worktree at `14218c4` as `terraform/rosa-hcp/terraform.tfstate`
