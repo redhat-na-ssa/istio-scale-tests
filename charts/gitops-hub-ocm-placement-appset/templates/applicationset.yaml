@@ -86,9 +86,9 @@ spec:
 {{- end }}
 {{- $helm := $src.helm | default dict }}
 {{- $vf := ternary list (.Values.memberValueFiles | default list) (not (empty $chartSrc)) }}
-{{- if or (and (eq $mode "clusterName") $helm.releaseName) (eq $mode "inClusterServer") ($helm.parameters) ($helm.valuesObject) $vf }}
+{{- if or $helm.releaseName (eq $mode "inClusterServer") ($helm.parameters) ($helm.valuesObject) $vf }}
         helm:
-{{- if and (eq $mode "clusterName") $helm.releaseName }}
+{{- if $helm.releaseName }}
           releaseName: {{ $helm.releaseName | quote }}
 {{- end }}
 {{- with $vf }}

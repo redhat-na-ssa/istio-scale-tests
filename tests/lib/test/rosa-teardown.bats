@@ -58,20 +58,31 @@ esac
 exit 0
 EOF
 	# aws: a VPC exists when listed in $STUB_DIR/live_vpcs; the ACM Observability bucket, role,
-	# user and policy counts come from obs_<kind> files (default 0); everything else is empty.
+	# user and policy counts come from obs_<kind> files (default 0), printed once per page
+	# (STUB_AWS_PAGES, default 1) with --output text, as the real CLI applies --query per page
+	# there; everything else is empty.
 	cat >"${STUB_DIR}/bin/aws" <<'EOF'
 #!/usr/bin/env bash
 echo "aws $*" >>"$STUB_LOG"
 args=" $* "
+obs_count() {
+	local n p
+	n="$(cat "$STUB_DIR/obs_$1" 2>/dev/null || echo 0)"
+	if [[ "$args" == *" --output text "* ]]; then
+		for ((p = 0; p < ${STUB_AWS_PAGES:-1}; p++)); do echo "$n"; done
+	else
+		echo "$n"
+	fi
+}
 case "$args" in
 *" configure get region "*) exit 1 ;;
 *" sns get-topic-attributes "*)
 	[[ -z "${STUB_SNS_FAIL:-}" ]] || { echo "An error occurred (NotFound) when calling the GetTopicAttributes operation" >&2; exit 254; }
 	echo "${STUB_SNS_CONFIRMED:-1}" ;;
-*" s3api list-buckets "*) cat "$STUB_DIR/obs_buckets" 2>/dev/null || echo 0 ;;
-*" iam list-roles "*) cat "$STUB_DIR/obs_roles" 2>/dev/null || echo 0 ;;
-*" iam list-users "*) cat "$STUB_DIR/obs_users" 2>/dev/null || echo 0 ;;
-*" iam list-policies "*) cat "$STUB_DIR/obs_policies" 2>/dev/null || echo 0 ;;
+*" s3api list-buckets "*) obs_count buckets ;;
+*" iam list-roles "*) obs_count roles ;;
+*" iam list-users "*) obs_count users ;;
+*" iam list-policies "*) obs_count policies ;;
 *" --output text "*) echo 0 ;;
 *" sts get-caller-identity "*) echo '{"Account":"000000000000"}' ;;
 *" ec2 describe-vpcs "*)
@@ -357,9 +368,9 @@ EOF
 	assert_output --partial "RESULT FAILED: cluster destroy: ok; full destroy: ok; audit: 1 item(s)"
 	# The hub is the first saved cluster name: the queries look for its names only.
 	run grep "s3api list-buckets" "${STUB_LOG}"
-	assert_output --partial "--region us-east-2 s3api list-buckets --query length(Buckets[?starts_with(Name, 'cluster-001-acm-obs-')]) --output text"
+	assert_output --partial "--region us-east-2 s3api list-buckets --query length(Buckets[?starts_with(Name, 'cluster-001-acm-obs-')]) --output json"
 	run grep "iam list-roles" "${STUB_LOG}"
-	assert_output --partial "--query length(Roles[?RoleName=='cluster-001-acm-obs-s3']) --output text"
+	assert_output --partial "--query length(Roles[?RoleName=='cluster-001-acm-obs-s3']) --output json"
 	run grep "iam list-policies" "${STUB_LOG}"
 	assert_output --partial "--scope Local"
 
@@ -374,6 +385,21 @@ EOF
 	assert_output --partial "audit: 2 item(s)"
 	run cat "${STUB_DIR}/window/teardown.result"
 	assert_output --partial " FAILED "
+}
+
+@test "003's ACM Observability audit reads one count in an account with several pages of IAM roles, users and policies" {
+	# With --output text the CLI would print one count per page ("0" twice) and the audit would
+	# report a lookup failure on a clean account.
+	echo '{}' >"${STUB_DIR}/output.json"
+	export STUB_AWS_PAGES=2
+	run bash "$S003" --now --state-dir "${STUB_DIR}/window" --region us-east-2 --retry-wait 0
+	assert_output --partial "OK    no S3 bucket cluster-001-acm-obs-* (ACM Observability)"
+	assert_output --partial "OK    no IAM role cluster-001-acm-obs-s3"
+	assert_output --partial "OK    no IAM user cluster-001-acm-obs-s3"
+	assert_output --partial "OK    no IAM policy cluster-001-acm-obs-s3"
+	refute_output --partial "acm-obs-s3: lookup failed"
+	run grep -c "acm-obs-.* --output text" "${STUB_LOG}"
+	assert_output "0"
 }
 
 @test "003 destroys nothing without --now: no mode, or --fire-after/--unit without --arm" {

@@ -216,7 +216,8 @@ deploys from itself. Edited charts roll out on the next apply.
 ## OpenShift add-ons: ACM Observability and Kiali
 
 Two toggles, both off by default and both for `platform = "openshift"` only (the plan refuses
-them on `kubernetes`, and with them off nothing changes on the clusters or in the release values).
+them on `kubernetes`, and with them off nothing changes on the clusters or in the app-of-apps
+values).
 Together they give one Kiali on the ACM hub that shows every mesh member: namespaces, workloads,
 services, Istio config validation, and a traffic graph and metrics for the namespaces you list.
 
@@ -231,6 +232,11 @@ services, Istio config validation, and a traffic graph and metrics for the names
 
 Kiali needs the app-of-apps (`enable_gitops`, `gitops_app_repo_url`). It works without
 `acm_observability`, but then its graph and metrics stay empty, and the plan warns.
+
+Upgrading an existing platform state to the commit that added the add-ons, with both off, still
+plans two in-place updates, `helm_release.argocd_config` and `helm_release.mesh_wiring_verify_appset`:
+their charts gained the add-ons' options, so their `chartChecksum` changed. They render the same
+manifests, so the two helm upgrades change nothing on the hub.
 
 ### Before you turn them on
 
@@ -283,7 +289,10 @@ kiali_multicluster = { enabled = true }
   to it yourself.
 - `acm_observability_values`: extra values for `charts/acm-observability`, merged over
   Terraform's, for example `mco.advanced` with per-component resources.
-- `kiali_multicluster.view_only` (true): Kiali shows the mesh but cannot change it.
+- `kiali_multicluster.view_only` (true): Kiali's UI shows the mesh but makes no changes (the
+  server's `view_only_mode`). The members' ServiceAccount has only the read-only `kiali-viewer`
+  role either way; with `false`, a change made in the UI goes through with the logged-in user's own
+  OpenShift permissions on that cluster.
 - The hub's ACM cluster (`acm_local_cluster_name`) stays enrolled in Observability, which gives
   ACM's Grafana the hub's own load during a run.
 
@@ -334,21 +343,33 @@ state and the root Application.
 
 ### Turn them off
 
-Set `enabled = false` and apply. Turning `kiali_multicluster` off removes the three Kiali child
-apps from the app-of-apps; the root syncs with prune off, so the apply then deletes them itself
-and waits until they are gone. Their PreDelete hooks delete each Kiali CR (the operator removes
-its OAuthClient, roles and ServiceAccount) and then the operator; a last step deletes any Kiali CR,
-Subscription or CSV left on each cluster, and the Kiali health check leaves the ArgoCD CR. Left
-behind: the hub's `istio-system` namespace and the CRD `kialis.kiali.io`.
+Set `enabled = false` and apply. Turning `kiali_multicluster` off first updates the app-of-apps,
+which then stops rendering the three Kiali child apps; the root syncs with prune off, so the apply
+next deletes them itself (`kiali_app_cleanup`) and waits until they are gone. Their PreDelete hooks
+delete each Kiali CR (the operator removes its OAuthClient, roles and ServiceAccount) and then the
+operator; a last step (`kiali_cr_cleanup`) deletes any Kiali CR, Subscription or CSV left on each
+cluster, and the Kiali health check leaves the ArgoCD CR. Left behind: the hub's `istio-system`
+namespace and the CRD `kialis.kiali.io`.
 
-Turning `acm_observability` off deletes the member metrics Applications (the monitors, the
-allowlists and `cluster-monitoring-config`, which stops user workload monitoring) and uninstalls
-the MultiClusterObservability. The apply then waits, up to 15 minutes, until ACM has removed the
-MCO and every cluster's ObservabilityAddon, and only then deletes the Secrets and the namespace
-(the Thanos volumes go with it). If the wait fails it names what is left, with the commands to
-inspect it, and the apply stops before the namespace goes. Left behind: the namespaces Argo CD
-created for listed namespaces that did not exist (delete them by hand when nothing else uses them)
-and the bucket's data, until `terraform/rosa-hcp` drops the bucket.
+The cleanup resources are `create_before_destroy`: that is what puts the app-of-apps update first.
+Without it Terraform would destroy them first (an updated resource waits for the destroy of what it
+depends on), the root's self-heal would recreate the apps the cleanup deletes, and they would stay
+behind, deployed, once the update lands. After the apply, this should list nothing for the add-on
+you turned off:
+
+```bash
+oc --context <hub-ctx> -n openshift-gitops get applications.argoproj.io,applicationsets.argoproj.io | grep -e kiali -e mesh-metrics
+```
+
+Turning `acm_observability` off works the same way for the member metrics Applications (the
+monitors, the allowlists and `cluster-monitoring-config`, which stops user workload monitoring;
+`mesh_metrics_member_cleanup` deletes what is left of them on each member), and it uninstalls the
+MultiClusterObservability. The apply then waits, up to 15 minutes, until ACM has removed the MCO
+and every cluster's ObservabilityAddon, and only then deletes the Secrets and the namespace (the
+Thanos volumes go with it). If the wait fails it names what is left, with the commands to inspect
+it, and the apply stops before the namespace goes. Left behind: the namespaces Argo CD created for
+listed namespaces that did not exist (delete them by hand when nothing else uses them) and the
+bucket's data, until `terraform/rosa-hcp` drops the bucket.
 
 ### Caveats
 
@@ -424,8 +445,9 @@ apply created it (never `kube-system` or a namespace without its label). For ROS
 `terraform/rosa-hcp/README.md`.
 
 With the OpenShift add-ons on, destroy first deletes the Kiali and member metrics Applications
-with the rest (their PreDelete hooks remove the Kiali CRs and operators), then deletes any Kiali CR,
-Subscription or CSV left on each cluster. In parallel it uninstalls the MultiClusterObservability
+with the rest (their PreDelete hooks remove the Kiali CRs and operators; the cascade then waits up
+to 20 minutes instead of 10), then deletes any Kiali CR, Subscription or CSV and anything labelled
+by `charts/spoke-mesh-metrics` left on each cluster. In parallel it uninstalls the MultiClusterObservability
 and waits, up to 15 minutes, until ACM has removed it and every cluster's ObservabilityAddon,
 before the observability namespace, the MultiClusterHub and the spokes go; when the wait fails the
 destroy stops there and names what is left. The `terraform/rosa-hcp` destroy then deletes the

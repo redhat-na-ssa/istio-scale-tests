@@ -706,10 +706,13 @@ OpenShift only
   Secrets (`charts/hub-kiali-remote-secret`); a PostSync hook re-reconciles the hub's Kiali once
   every member's secret exists.
 - Destroy: `terraform/scripts/acm-observability-delete-wait.sh`, an `APP_NAMES` mode in
-  `argocd-app-cleanup.sh` (turning a toggle off deletes its Applications), `DELETE_CRS` in
-  `cleanup-olm-csv.sh`; the ROSA teardown audit also checks the bucket, role, user and policy.
-- bats: `spoke-mesh-metrics.bats`, `kiali-addon.bats`, `chart-platforms.bats` (OpenShift-only
-  lists, the namespace matrix), the destroy helpers' bats and `rosa-teardown.bats`.
+  `argocd-app-cleanup.sh` (turning a toggle off deletes its Applications; the cleanup resources
+  are `create_before_destroy` so that the app-of-apps update runs first), `DELETE_CRS` in
+  `cleanup-olm-csv.sh`, `mesh-metrics-cleanup.sh` (what the member metrics Applications left on
+  each member); the ROSA teardown audit also checks the bucket, role, user and policy.
+- bats: `spoke-mesh-metrics.bats`, `kiali-addon.bats` (also that `terraform/platform` still
+  writes the value paths the tests feed the charts), `chart-platforms.bats` (OpenShift-only lists,
+  the namespace matrix), the destroy helpers' bats and `rosa-teardown.bats`.
 
 **Validated:** offline only (bats, `helm template`, `terraform validate`). Nothing has run on a
 cluster, and no sidecar workload runs there yet, so the metrics path is unproven.
@@ -721,7 +724,9 @@ cluster, and no sidecar workload runs there yet, so the metrics path is unproven
   cross-cluster graph edges from mesh-verify traffic, hub and member load after an hour, and a clean
   teardown (toggles off, then a full destroy and the audit). Record the numbers here.
 - **Assumptions to check in that run** (from the offline build, not yet seen on a cluster):
-  External Secrets' hop 1 reads `ca.crt` through a second store (`data[].sourceRef.storeRef`) and
+  turning each toggle off removes its Applications for good (the app-of-apps update before the
+  cleanups' destroy, from `create_before_destroy`; Terraform's source says so, no apply has shown
+  it); External Secrets' hop 1 reads `ca.crt` through a second store (`data[].sourceRef.storeRef`) and
   leaves `certificate-authority-data` out when it is empty; the Kiali CR health check turns
   Healthy after a reconcile that first failed; the OpenShift GitOps controller can create the hub
   hook Roles (`kiali-reconcile`, `kiali-cleanup`) through the chart's `rbac-argocd` Roles; the
@@ -746,6 +751,16 @@ cluster, and no sidecar workload runs there yet, so the metrics path is unproven
   the members can exceed the default MCO size's rating of 200k active series.
 - **Platform record:** a line in `tests/lib/platform.sh` that records the add-on, so a run with the
   extra scraping is labelled.
+
+## Follow-ups found during the 2026-10-29 add-on review
+
+- Helm refuses a release name over 53 characters, and an ApplicationSet preset without
+  `releaseName` names the release after the Application, `<member>-<suffix>`. For the hub's
+  `inClusterServer` presets that caps kubeconfig-mode member names below the 44 characters
+  `spoke_cluster_contexts` allows: 22 for `hub-kubeconfig-from-argosecret`, 28 for
+  `hub-mesh-ca-intermediate`, 31 for `hub-mesh-push-secrets` (a longer name leaves that member's
+  Application with a ComparisonError). The Kiali preset sets a short `releaseName` and names its
+  objects from `clusterName`; do the same for those three, or lower the variable's limit to 22.
 
 ## Follow-ups found during the 2026-10-13 work
 

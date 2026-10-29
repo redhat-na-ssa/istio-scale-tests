@@ -289,17 +289,17 @@ An `auth_strategy = "anonymous"` value can stay as an **unsupported** fallback f
   - Each has `enabled: false` in `values.yaml`.
   - Sync waves: 30, 31, 32 and 33, in that order, after the east-west gateways at wave 27.
 - **`charts/argocd-config/`** gets `argocd.kialiHealthCheck`, a `kiali.io/Kiali` resource health check that Terraform turns on only while `kiali_multicluster` is on.
-- Unchanged: `charts/istiod-monitor/` (installed by hand; with the add-on on, only its PrometheusRule) and the mesh-verify charts.
+- Unchanged: `charts/istiod-monitor/` (installed by hand; with the add-on on, with `enableUserWorkloadMonitoring=false` and its own ServiceMonitor kept, the only scrape of the `_bucket` series its rules read) and the mesh-verify charts.
 
 ### 5.3 Tests and docs
 
-- **Tests:** `chart-platforms.bats` (the new charts and presets on the OpenShift-only lists, the matrix shape), `kiali-addon.bats` (the add-on renders on openshift when enabled and never on kubernetes, the remote CR, the reconcile hook, the remote secret, the matrix preset, the health check), `spoke-mesh-metrics.bats`, and the destroy helpers' bats (`argocd-app-cleanup.bats`, `cleanup-olm-csv.bats`, `acm-observability-delete-wait.bats`, `rosa-teardown.bats`). Default renders do not fail when the computed values are empty, because CI renders every preset with defaults (`portability.yml`).
+- **Tests:** `chart-platforms.bats` (the new charts and presets on the OpenShift-only lists, the matrix shape), `kiali-addon.bats` (the add-on renders on openshift when enabled and never on kubernetes, the remote CR, the reconcile hook, the remote secret, the matrix preset, the health check), `spoke-mesh-metrics.bats`, and the destroy helpers' bats (`argocd-app-cleanup.bats`, `cleanup-olm-csv.bats`, `acm-observability-delete-wait.bats`, `mesh-metrics-cleanup.bats`, `rosa-teardown.bats`). Default renders do not fail when the computed values are empty, because CI renders every preset with defaults (`portability.yml`).
 - **Docs:**
   - `charts/README.md`: wave table and charts table; a README per new chart;
   - `README.md`: hub and member namespace tables;
   - `CONTRIBUTING.md`: version pins (`kiali-ossm stable` / `v2.27.5`, MCO API `v1beta2`) and the repo map;
   - `terraform/platform/README.md`: "OpenShift add-ons: ACM Observability and Kiali", and teardown; `terraform/rosa-hcp/README.md`: the bucket;
-  - `tests/propagation/README.md`: with the add-on on, `helm install istiod-monitor` only for its PrometheusRule;
+  - `tests/propagation/README.md`: with the add-on on, `helm install istiod-monitor` without user workload monitoring, and `pilot_xds_pushes` filtered on `app=""` (istiod is scraped twice);
   - `BACKLOG.md` section 10;
   - the `docs/runbooks/rosa-validation` runbook after the live run;
   - `STRATEGY.md`.
@@ -336,13 +336,14 @@ An `auth_strategy = "anonymous"` value can stay as an **unsupported** fallback f
 - The namespace, the pull-secret copy and `thanos-object-storage` (in ROSA mode from the `terraform/rosa-hcp` outputs, read through `terraform_remote_state`).
 - `helm_release.acm_observability`, after `terraform_data.argocd_app_status_check`, so the member metrics apps have turned user workload monitoring on first.
 - `terraform_data.acm_observability_delete_wait`. The helm release depends on it, so on destroy its destroy-time provisioner (`terraform/scripts/acm-observability-delete-wait.sh`) runs **after** helm uninstall. It waits up to 15 minutes for the MCO and every ObservabilityAddon to be gone before the MultiClusterHub and the spokes are torn down.
-- The `spoke-mesh-metrics-appset` values (namespace list, user workload monitoring switch) and `terraform_data.mesh_metrics_app_cleanup`.
+- The `spoke-mesh-metrics-appset` values (namespace list, user workload monitoring switch), `terraform_data.mesh_metrics_app_cleanup`, and `terraform_data.mesh_metrics_member_cleanup` per member (`terraform/scripts/mesh-metrics-cleanup.sh`: deletes what is left with the chart's label, `cluster-monitoring-config` included, when the Applications lost their finalizers).
 
 **New file `platform_kiali.tf`:**
 - `data "kubernetes_resource"` for the hub ingress domain, which gives the hub Route `kiali-istio-system.<hub apps domain>`, the members' callback base `https://kiali-istio-system.<hub apps domain>/api/auth/callback` and the output `kiali_url`.
 - The values of `hub-kiali` (`clusterName` = the ACM local cluster name, `remoteClusters` = the members, `viewOnly`, the interval and retention), `spoke-kiali-appset` (`hubRedirectBase`, `viewOnly`) and `hub-kiali-remote-secret-appset`.
 - `terraform_data.kiali_app_cleanup`, with a destroy provisioner (`terraform/scripts/argocd-app-cleanup.sh`, `APP_NAMES` mode) that cascade-deletes the three Kiali child Applications. The root syncs with `prune: false` (`gitops-hub-app-of-apps/values.yaml`), so this resource is how switching the toggle off actually removes them; `mesh_metrics_app_cleanup` does the same for the metrics apps.
 - `terraform_data.kiali_cr_cleanup` for the hub and each member, modelled on `spoke_ossm_csv_cleanup`. It deletes any Kiali CR left in `istio-system` (stripping a stuck finalizer), then the Subscription and CSV, and it is added to `argocd_app_cleanup.depends_on`.
+- All four cleanup resources are `create_before_destroy` (section 6.3).
 
 **Elsewhere:**
 - `platform_gitops.tf`: the add-on app values go into the app-of-apps release as their own document, only when non-empty, between `provider_app_defaults` and `gitops_app_overrides` (with both toggles off the release values do not change); `argocd.kialiHealthCheck.enabled` is set on `helm_release.argocd_config` only while Kiali is on.
@@ -352,16 +353,16 @@ An `auth_strategy = "anonymous"` value can stay as an **unsupported** fallback f
 ### 6.3 Destroy order
 
 Turning `kiali_multicluster` off (one apply):
-1. The app-of-apps release is updated first: the root stops rendering the three Kiali children (with `prune: false` it does not delete them).
+1. The app-of-apps release is updated first: the root stops rendering the three Kiali children (with `prune: false` it does not delete them). This order needs `create_before_destroy` on the cleanup resources. The app-of-apps depends on them, and an updated resource normally waits for the destroy of what its stored dependencies name (Terraform's `DestroyEdgeTransformer`); a `create_before_destroy` object being destroyed waits for its dependents' updates instead (`CBDEdgeTransformer`, the flag read from the state). Without it the cleanup runs while the root still renders the children, the root's self-heal recreates them, and they stay deployed after the update.
 2. `kiali_app_cleanup` waits until the root no longer wants them and deletes them. Their finalizers cascade: the ApplicationSets, the generated Applications, the PreDelete hooks (each Kiali CR, then the Subscription and CSV), then the rest; the hub remote secrets go with their ExternalSecrets.
-3. `kiali_cr_cleanup` is the safety net on each cluster.
+3. `kiali_cr_cleanup` is the safety net on each cluster (also `create_before_destroy`: the app-of-apps depends on it through `kiali_app_cleanup`).
 4. `argocd_config` drops the Kiali health check.
 
 Left behind: the hub `istio-system` namespace and the CRD `kialis.kiali.io`.
 
-Turning `acm_observability` off: `mesh_metrics_app_cleanup` deletes the metrics apps (namespaces they created stay), and `helm_release.acm_observability` is uninstalled while the spokes are still attached; `acm_observability_delete_wait` waits for the MCO and the ObservabilityAddons to go; then the Secrets and the namespace go.
+Turning `acm_observability` off: the same order for the metrics apps. After the app-of-apps update `mesh_metrics_app_cleanup` deletes them (namespaces they created stay) and `mesh_metrics_member_cleanup` deletes anything with the chart's label left on each member; independently `helm_release.acm_observability` is uninstalled while the spokes are still attached; `acm_observability_delete_wait` waits for the MCO and the ObservabilityAddons to go; then the Secrets and the namespace go.
 
-A full destroy runs `argocd_app_cleanup` (the root's cascade), the cleanups above, `kiali_cr_cleanup` and the existing `spoke_ossm_csv_cleanup`, and in parallel the MCO chain, which completes before the MultiClusterHub and the ManagedClusters go. The `rosa-hcp` destroy then deletes the bucket, the role, the policy and the user.
+A full destroy runs `argocd_app_cleanup` (the root's cascade; 20 minutes instead of 10 with Kiali on, for the PreDelete hooks), the cleanups above, `kiali_cr_cleanup`, `mesh_metrics_member_cleanup` and the existing `spoke_ossm_csv_cleanup`, and in parallel the MCO chain, which completes before the MultiClusterHub and the ManagedClusters go. The `rosa-hcp` destroy then deletes the bucket, the role, the policy and the user.
 
 The observability volumes are deleted along with their namespace (gp3-csi reclaim policy is Delete). The auto-teardown audit's EBS check would catch any leak.
 

@@ -364,6 +364,8 @@ For changing the harness (not needed to run it):
 - [BACKLOG.md](BACKLOG.md), [STRATEGY.md](STRATEGY.md): open work and the reasoning behind the
   suites.
 - [docs/scale-test-team](docs/scale-test-team/README.md): how harness changes are reviewed.
+- [docs/design](docs/design/kiali-acm-multicluster.md): the design of the OpenShift Kiali and ACM
+  Observability add-on, with what the build changed.
 
 ## License
 

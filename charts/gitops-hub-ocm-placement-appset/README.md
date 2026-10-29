@@ -37,6 +37,12 @@ or in a string of `template.source.helm.valuesObject` (the gate's preset passes 
 so): the template rewrites it to `{{name}}` for the `clusters` generator, and Argo CD fills it in
 for each member. Static values go in `template.source.helm.valuesObject`.
 
+Without `template.source.helm.releaseName` Argo CD uses the Application's name as the Helm release
+name, and Helm refuses one over 53 characters: `<member>-<applicationNameSuffix>` must fit, or the
+preset sets a short `releaseName`. In `inClusterServer` mode every member's Application then shares
+that release name on the hub, so its chart must name its objects from `clusterName`
+(`values-kiali-remote-secret.yaml` does this with `charts/hub-kiali-remote-secret`).
+
 `namespaceMatrix` adds a second dimension: with `enabled: true` the ApplicationSet makes one
 Application per mesh member and per namespace in `namespaceMatrix.namespaces` (a matrix of the
 member generator and a list generator with one `{targetNamespace: <ns>}` element per namespace).

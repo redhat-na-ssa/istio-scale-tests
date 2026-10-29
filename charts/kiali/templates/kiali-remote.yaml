@@ -1,7 +1,8 @@
 {{- if eq (include "kiali.mode" .) "remote" }}
 # On a mesh member: no Kiali server, only what the hub's Kiali needs here: the ServiceAccount
-# kiali-service-account (read-only kiali-viewer role with viewOnly), its roles and the
-# OAuthClient kiali-istio-system whose redirect URI is the hub's callback for this member.
+# kiali-service-account (the read-only kiali-viewer role, whatever viewOnly says: the openshift
+# login), its roles and the OAuthClient kiali-istio-system whose redirect URI is the hub's
+# callback for this member.
 apiVersion: kiali.io/v1alpha1
 kind: Kiali
 metadata:

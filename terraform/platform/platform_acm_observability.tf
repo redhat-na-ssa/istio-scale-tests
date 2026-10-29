@@ -199,10 +199,48 @@ resource "helm_release" "acm_observability" {
   depends_on = [terraform_data.acm_observability_delete_wait, terraform_data.argocd_app_status_check]
 }
 
+# Destroy-time safety net per mesh member, for when mesh_metrics_app_cleanup or the root's
+# cascade timed out and stripped the Applications' finalizers (Argo CD then deleted nothing):
+# deletes what is left with charts/spoke-mesh-metrics' label in the listed namespaces and
+# openshift-monitoring, so user workload monitoring does not keep running on the members. A
+# cluster-monitoring-config of your own (without that label) is never touched.
+resource "terraform_data" "mesh_metrics_member_cleanup" {
+  for_each = local.acm_observability_enabled && local.addon_gitops ? local.mesh_member_spoke_set : toset([])
+
+  input = {
+    token_script    = local.token_script
+    api_url         = local.by_cluster[each.key].cluster_api_url
+    admin_pass      = local.admin_password
+    kubeconfig_path = local.kubeconfig
+    context         = each.key
+    namespaces      = join(" ", var.acm_observability.istio_metrics_namespaces)
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "bash '${path.module}/../scripts/mesh-metrics-cleanup.sh'"
+    environment = {
+      TOKEN_SCRIPT    = self.input.token_script
+      API_URL         = self.input.api_url
+      ADMIN_PASS      = self.input.admin_pass
+      KUBECONFIG_PATH = self.input.kubeconfig_path
+      KUBE_CONTEXT    = self.input.context
+      NAMESPACES      = self.input.namespaces
+    }
+  }
+
+  # create_before_destroy: see mesh_metrics_app_cleanup (the app-of-apps depends on this one
+  # through it).
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
 # Turning acm_observability off: the root Application stops rendering the member metrics
 # ApplicationSet but, with prune off, does not delete it. On destroy this deletes the child
 # Application once the root no longer wants it; its finalizers remove the generated Applications
-# and what they deployed (namespaces Argo CD created stay).
+# and what they deployed (namespaces Argo CD created stay). Then mesh_metrics_member_cleanup runs
+# on each member.
 resource "terraform_data" "mesh_metrics_app_cleanup" {
   count = local.acm_observability_enabled && local.addon_gitops ? 1 : 0
 
@@ -231,6 +269,17 @@ resource "terraform_data" "mesh_metrics_app_cleanup" {
       APPSET_NAMES    = self.input.appset_names
     }
   }
+
+  # The app-of-apps depends on this resource, and Terraform runs an update after the destroy of
+  # what the updated resource depends on: turning the add-on off would run this cleanup while the
+  # root still renders the ApplicationSet, and its self-heal would recreate it. create_before_destroy
+  # reverses that order, so the app-of-apps update comes first. (terraform_data is replaced only
+  # through triggers_replace, which this does not use, so nothing else changes.)
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  depends_on = [terraform_data.mesh_metrics_member_cleanup]
 }
 
 check "acm_observability_metrics_apps" {

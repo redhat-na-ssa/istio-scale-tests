@@ -5,6 +5,9 @@ release per mesh member: the ApplicationSet `hub-kiali-remote-secret`
 (`values-kiali-remote-secret.yaml` in `charts/gitops-hub-ocm-placement-appset`) makes the
 Application `<member>-hub-kiali-remote-secret`, which passes `clusterName` and `clusterServer`
 (the member's API URL from its Argo CD cluster Secret). Without both the chart renders nothing.
+Every member's release is named `kiali-remote-secret` (the preset's `releaseName`: the Application
+name would pass Helm's 53-character limit from a 30-character member name), so every object is
+named from `clusterName`, the Argo CD sync Roles too (`kiali-<member>-argocd-sync`).
 
 It writes `istio-system/kiali-remote-cluster-secret-<member>`: label
 `kiali.io/multiCluster: "true"`, annotation `kiali.io/cluster: <member>`, one data key `<member>`

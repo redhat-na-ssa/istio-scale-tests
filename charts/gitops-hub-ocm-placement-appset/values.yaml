@@ -91,7 +91,10 @@ template:
     repoURL: ""
     chart: ""
     targetRevision: ""
-    # releaseName (clusterName mode only), parameters, valuesObject.
+    # releaseName, parameters, valuesObject. Without releaseName Argo CD uses the Application's
+    # name, and Helm refuses a release name over 53 characters. In inClusterServer mode every
+    # member's Application shares the releaseName on the hub, so the chart must name its objects
+    # from clusterName.
     helm: {}
   # Extra syncPolicy.syncOptions of the generated Applications (e.g. CreateNamespace=true).
   syncOptions: []

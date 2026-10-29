@@ -190,8 +190,12 @@ helm install istiod-monitor charts/istiod-monitor -n istio-system --kube-context
 ```
 
 With the OpenShift add-on `acm_observability` on, the member already has user workload monitoring
-and an istiod ServiceMonitor ([`charts/spoke-mesh-metrics`](../../charts/spoke-mesh-metrics/README.md)),
-so install only the PrometheusRule: add `--set enableUserWorkloadMonitoring=false --set serviceMonitor.enabled=false`.
+and an istiod ServiceMonitor ([`charts/spoke-mesh-metrics`](../../charts/spoke-mesh-metrics/README.md#with-chartsistiod-monitor)):
+keep `enableUserWorkloadMonitoring=false` (the default), and keep istiod-monitor's own
+ServiceMonitor, the only one that scrapes the `_bucket` series its quantile rules read. istiod is
+then scraped twice, so `pilot:xds_pushes:rate_5m` counts every push twice: read
+`sum(rate(pilot_xds_pushes{app=""}[5m])) by (type)` instead (the add-on's copy carries
+`app="istiod"`).
 
 ## Outputs
 

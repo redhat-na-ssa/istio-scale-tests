@@ -596,12 +596,14 @@ audit() {
     log "  LEAK? hub cluster name '${hub}' is not a plain name: check the ACM Observability bucket and IAM by hand"
     AUDIT_LEAKS=$((AUDIT_LEAKS + 1))
   else
+    # --output json, not text: with text the CLI runs the query once per page (IAM lists 100 per
+    # page), and a second page would print a second number.
     audit_count "S3 bucket ${hub}-acm-obs-* (ACM Observability)" --region "${REGION}" s3api list-buckets \
-      --query "length(Buckets[?starts_with(Name, '${hub}-acm-obs-')])" --output text
-    audit_count "IAM role ${hub}-acm-obs-s3" iam list-roles --query "length(Roles[?RoleName=='${hub}-acm-obs-s3'])" --output text
-    audit_count "IAM user ${hub}-acm-obs-s3" iam list-users --query "length(Users[?UserName=='${hub}-acm-obs-s3'])" --output text
+      --query "length(Buckets[?starts_with(Name, '${hub}-acm-obs-')])" --output json
+    audit_count "IAM role ${hub}-acm-obs-s3" iam list-roles --query "length(Roles[?RoleName=='${hub}-acm-obs-s3'])" --output json
+    audit_count "IAM user ${hub}-acm-obs-s3" iam list-users --query "length(Users[?UserName=='${hub}-acm-obs-s3'])" --output json
     audit_count "IAM policy ${hub}-acm-obs-s3" iam list-policies --scope Local \
-      --query "length(Policies[?PolicyName=='${hub}-acm-obs-s3'])" --output text
+      --query "length(Policies[?PolicyName=='${hub}-acm-obs-s3'])" --output json
   fi
   if t0="$(read_t0)"; then
     t0iso="$(fmt_utc "${t0}" '%Y-%m-%dT%H:%M:%S')"

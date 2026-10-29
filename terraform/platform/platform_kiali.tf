@@ -105,6 +105,13 @@ resource "terraform_data" "kiali_cr_cleanup" {
       DELETE_CRS      = self.input.delete_crs
     }
   }
+
+  # create_before_destroy: see kiali_app_cleanup. The app-of-apps depends on this one too (through
+  # kiali_app_cleanup), so without it turning the add-on off would run this before the
+  # app-of-apps update, while the root still deploys Kiali.
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Turning kiali_multicluster off: the root Application stops rendering the three Kiali child
@@ -139,6 +146,15 @@ resource "terraform_data" "kiali_app_cleanup" {
       APP_NAMES       = self.input.app_names
       APPSET_NAMES    = self.input.appset_names
     }
+  }
+
+  # The app-of-apps depends on this resource, and Terraform runs an update after the destroy of
+  # what the updated resource depends on: turning the add-on off would run this cleanup while the
+  # root still renders the apps, and its self-heal would recreate them. create_before_destroy
+  # reverses that order, so the app-of-apps update comes first. (terraform_data is replaced only
+  # through triggers_replace, which these do not use, so nothing else changes.)
+  lifecycle {
+    create_before_destroy = true
   }
 
   depends_on = [terraform_data.kiali_cr_cleanup]

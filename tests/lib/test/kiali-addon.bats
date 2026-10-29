@@ -4,10 +4,11 @@
 # charts/kiali gives a member's Kiali CR the hub's callback for that member as its first redirect
 # URI and fails without it, and the hub's CR the external model and the metrics settings, with a
 # PostSync hook that waits for every member's remote secret and reruns when the members change;
-# charts/hub-kiali-remote-secret writes the secret Kiali autodetects and never labels a store for
-# charts/hub-mesh-push-secrets; the metrics preset makes one Application per member and
-# namespace; argocd-config adds the Kiali health check only when asked. Needs helm; skips
-# without it.
+# charts/hub-kiali-remote-secret writes the secret Kiali autodetects, never labels a store for
+# charts/hub-mesh-push-secrets, and renders for a 44-character member under its preset's short
+# release name; the metrics preset makes one Application per member and namespace; argocd-config
+# adds the Kiali health check only when asked; terraform/platform still writes the value paths
+# these tests feed the charts. Needs helm; skips without it.
 
 bats_require_minimum_version 1.5.0
 load test_helper
@@ -142,7 +143,8 @@ EOF
 
 @test "hub-kiali-remote-secret: the secret Kiali autodetects, from a store charts/hub-mesh-push-secrets never selects; nothing without the member's server" {
 	local out
-	out="$(helm template member-a-hub-kiali-remote-secret "$REMOTE_SECRET" -f "${REMOTE_SECRET}/values-openshift.yaml" \
+	# The preset's release name, shared by every member's Application on the hub.
+	out="$(helm template kiali-remote-secret "$REMOTE_SECRET" -f "${REMOTE_SECRET}/values-openshift.yaml" \
 		--set clusterName=member-a --set clusterServer=https://api.member-a.example.invalid:6443)"
 	grep -A12 -x '  target:' <<<"$out" | grep -qx '    name: "kiali-remote-cluster-secret-member-a"'
 	grep -qx '          kiali.io/multiCluster: "true"' <<<"$out"
@@ -153,8 +155,30 @@ EOF
 	# No label of charts/hub-mesh-push-secrets (its PushSecrets select stores by them).
 	! grep -qE '^ +hub-mesh-push-secrets/' <<<"$out" || false
 	grep -qx '    namespace: "openshift-gitops"' <<<"$out"
+	# Named from the member, not the shared release: two members' Roles never collide.
+	# Role and RoleBinding (and its roleRef) in external-secrets-operator and istio-system.
+	[ "$(grep -cx '  name: "kiali-member-a-argocd-sync"' <<<"$out")" -eq 6 ]
+	! grep -q 'kiali-remote-secret-argocd-sync' <<<"$out" || false
 	[ -z "$(helm template x "$REMOTE_SECRET" --set clusterName=member-a)" ]
 	[ -z "$(helm template x "$REMOTE_SECRET" --set clusterServer=https://api.member-a.example.invalid:6443)" ]
+}
+
+@test "kiali-remote-secret preset: a short release name, so a member name of up to 44 characters renders" {
+	local p out m
+	m=member-0123456789-0123456789-0123456789-abcd
+	[ "${#m}" -eq 44 ]
+	for p in kubernetes openshift; do
+		out="$(helm template preset "$APPSET" -f "${APPSET}/values-kiali-remote-secret.yaml" -f "${APPSET}/platform-${p}.yaml" "${REPO[@]}")"
+		grep -qx '          releaseName: "kiali-remote-secret"' <<<"$out" || { echo "$p: no releaseName kiali-remote-secret"; false; }
+	done
+	# What Argo CD runs for that member: helm template --name-template <releaseName>.
+	helm template --name-template kiali-remote-secret "$REMOTE_SECRET" --set "clusterName=${m}" \
+		--set clusterServer=https://api.example.invalid:6443 >/dev/null
+	# Without it the release would be the Application's name, which Helm refuses.
+	run helm template --name-template "${m}-hub-kiali-remote-secret" "$REMOTE_SECRET" --set "clusterName=${m}" \
+		--set clusterServer=https://api.example.invalid:6443
+	assert_failure
+	assert_output --partial 'must not be longer than 53'
 }
 
 @test "mesh-metrics preset: one Application per member and namespace, the namespace created; members and clusterName only" {
@@ -182,6 +206,47 @@ EOF
 	run helm template preset "$APPSET" -f "${APPSET}/values-mesh-metrics.yaml" "${REPO[@]}" --set-json 'namespaceMatrix.namespaces=[]'
 	assert_failure
 	assert_output --partial 'namespaceMatrix.namespaces is empty'
+}
+
+@test "terraform/platform still writes the values the tests above feed the charts" {
+	# The tests hand the charts copies of Terraform's values; a renamed key or path in
+	# platform_kiali.tf or platform_acm_observability.tf would leave them green while every member
+	# render fails (no hubRedirectBase) or falls back to the preset's defaults (istio-system only).
+	local tf_kiali="${ROOT}/terraform/platform/platform_kiali.tf" tf_obs="${ROOT}/terraform/platform/platform_acm_observability.tf"
+	local tf_gitops="${ROOT}/terraform/platform/platform_gitops.tf" f re
+	while IFS='|' read -r f re; do
+		[[ -n "$f" ]] || continue
+		grep -Eq "$re" "${!f}" || { echo "${!f##*/} no longer matches /${re}/: update this test and the charts' values"; false; }
+	done <<'EOF'
+tf_kiali|^    "hub-kiali" = \{$
+tf_kiali|^        clusterName = local\.acm_local_cluster_name$
+tf_kiali|^        remoteClusters = local\.mesh_member_spoke_keys$
+tf_kiali|^        viewOnly += var\.kiali_multicluster\.view_only$
+tf_kiali|^        prometheus = \{$
+tf_kiali|^          scrapeInterval += "\$\{var\.acm_observability\.interval_sec\}s"$
+tf_kiali|^          retentionPeriod = var\.acm_observability\.retention$
+tf_kiali|^    "spoke-kiali-appset" = \{$
+tf_kiali|^      values = \{ template = \{ source = \{ helm = \{ valuesObject = \{$
+tf_kiali|^        hubRedirectBase = local\.kiali_redirect_base$
+tf_kiali|^    "hub-kiali-remote-secret-appset" = \{ enabled = true \}$
+tf_obs|^    "spoke-mesh-metrics-appset" = \{$
+tf_obs|^        namespaceMatrix = \{ namespaces = var\.acm_observability\.istio_metrics_namespaces \}$
+tf_obs|^        template = \{ source = \{ helm = \{ valuesObject = \{$
+tf_obs|^          userWorkloadMonitoring = \{ enabled = var\.acm_observability\.enable_user_workload_monitoring \}$
+tf_gitops|^        name  = "argocd\.kialiHealthCheck\.enabled"$
+tf_gitops|length\(local\.addon_app_defaults\) > 0 \? \[yamlencode\(\{ apps = local\.addon_app_defaults \}\)\] : \[\]
+EOF
+	# The same keys exist where the tests set them: the app-of-apps' apps and the charts' values.
+	for f in spoke-mesh-metrics-appset spoke-kiali-appset hub-kiali hub-kiali-remote-secret-appset; do
+		grep -qx "  ${f}:" "${ROOT}/charts/gitops-hub-apps/values.yaml" || { echo "gitops-hub-apps has no apps.${f}"; false; }
+	done
+	grep -qx 'clusterName: ""' "${KIALI}/values.yaml"
+	grep -qx 'remoteClusters: \[\]' "${KIALI}/values.yaml"
+	grep -qx 'hubRedirectBase: ""' "${KIALI}/values.yaml"
+	grep -qx '  scrapeInterval: 60s' "${KIALI}/values.yaml"
+	grep -qx '  retentionPeriod: 14d' "${KIALI}/values.yaml"
+	grep -qx '  enabled: true' <(grep -A3 -x 'userWorkloadMonitoring:' "${ROOT}/charts/spoke-mesh-metrics/values.yaml")
+	grep -qx '  kialiHealthCheck:' "${ROOT}/charts/argocd-config/values.yaml"
 }
 
 @test "argocd-config: the Kiali health check only when enabled" {

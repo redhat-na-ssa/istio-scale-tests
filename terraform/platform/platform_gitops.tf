@@ -559,8 +559,9 @@ resource "helm_release" "gitops_hub_app_of_apps" {
     yamlencode({ chartChecksum = local.chart_checksum["gitops-hub-app-of-apps"] })],
   )
 
-  # The add-ons' cleanup resources: on destroy (or when an add-on is turned off) they run after
-  # this release no longer renders their apps.
+  # The add-ons' cleanup resources: on destroy they run after this release is gone. When an add-on
+  # is turned off they run after this release's update stops rendering their apps, because they
+  # are create_before_destroy (without it Terraform would destroy them before this update).
   depends_on = [
     helm_release.acm_gitops_resources,
     helm_release.argocd,
@@ -930,14 +931,16 @@ resource "terraform_data" "spoke_ossm_csv_cleanup" {
 resource "terraform_data" "argocd_app_cleanup" {
   count = local.gitops_enabled && var.gitops_app_repo_url != "" ? 1 : 0
 
-  input = {
+  # With kiali_multicluster on, the cascade waits longer: each Kiali PreDelete hook may wait up to
+  # 300 s for its CR (only then is the key in the input, so a plan with the add-on off is unchanged).
+  input = merge({
     token_script     = local.token_script
     hub_api_url      = local.hub_api_url
     hub_admin_pass   = local.hub_admin_pass
     kubeconfig_path  = local.kubeconfig
     hub_context      = local.hub_cluster_key
     gitops_namespace = local.gitops_namespace
-  }
+  }, local.kiali_enabled ? { timeout_sec = "1200" } : {})
 
   # Destroyed before these: the member apps are deleted while Argo CD can still reach the
   # spokes through their cluster Secrets.
@@ -946,6 +949,7 @@ resource "terraform_data" "argocd_app_cleanup" {
     terraform_data.spoke_ossm_csv_cleanup,
     terraform_data.spoke_access_cleanup,
     terraform_data.kiali_cr_cleanup,
+    terraform_data.mesh_metrics_member_cleanup,
   ]
 
   provisioner "local-exec" {
@@ -958,6 +962,7 @@ resource "terraform_data" "argocd_app_cleanup" {
       KUBECONFIG_PATH = self.input.kubeconfig_path
       KUBE_CONTEXT    = self.input.hub_context
       GITOPS_NS       = self.input.gitops_namespace
+      TIMEOUT_SEC     = try(self.input.timeout_sec, "600")
     }
   }
 }

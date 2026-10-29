@@ -65,6 +65,9 @@ oc --context <mesh-a-ctx> -n openshift-monitoring get cm cluster-monitoring-conf
 A member that already has this ConfigMap (with other cluster monitoring settings) needs
 `acm_observability.enable_user_workload_monitoring = false`: then add `enableUserWorkload: true` to
 it yourself. Turning the add-on off deletes the ConfigMap, and with it user workload monitoring.
+If Argo CD could not (its Applications lost their finalizers on a timeout), Terraform's
+`mesh_metrics_member_cleanup` deletes what is left with this chart's label
+(`app.kubernetes.io/name=spoke-mesh-metrics`) on each member, never a ConfigMap without it.
 
 User workload monitoring comes first: ACM's `uwl-metrics-collector-deployment` starts only once the
 member's user-workload Prometheus exists. If it is still missing after the pods in
@@ -78,14 +81,23 @@ oc --context <mesh-a-ctx> -n open-cluster-management-addon-observability rollout
 
 ## With charts/istiod-monitor
 
-`charts/istiod-monitor` (installed by hand for the propagation suite) overlaps this chart: its
-ServiceMonitor `istiod` scrapes istiod a second time, and its `enableUserWorkloadMonitoring` writes
-the same `cluster-monitoring-config`. With the add-on on, install only its PrometheusRule:
+`charts/istiod-monitor` (installed by hand for the propagation suite) overlaps this chart in two
+places. Its `enableUserWorkloadMonitoring` writes the same `cluster-monitoring-config`, so keep it
+false with the add-on on (its default). Keep its ServiceMonitor `istiod`: this chart's
+`mesh-metrics-istiod` drops the `_bucket` series (and the queue-time and push-time ones) that the
+PrometheusRule's convergence and push-time quantiles read.
 
 ```bash
 helm install istiod-monitor charts/istiod-monitor -n istio-system --kube-context <mesh-a-ctx> \
-  --set enableUserWorkloadMonitoring=false --set serviceMonitor.enabled=false
+  --set enableUserWorkloadMonitoring=false
 ```
+
+istiod is then scraped twice. `pilot_xds`, `pilot_xds_pushes` and
+`pilot_proxy_convergence_time_sum` / `_count` exist twice in the user-workload Prometheus: this
+chart's copy carries `app="istiod"`, istiod-monitor's has no `app` label. The quantile rules read
+only istiod-monitor's `_bucket` series and are right, but `pilot:xds_pushes:rate_5m` adds both
+copies and counts every push twice. Query istiod-monitor's copy instead:
+`sum(rate(pilot_xds_pushes{app=""}[5m])) by (type)`.
 
 ## Check it
 

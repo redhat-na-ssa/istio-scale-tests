@@ -1,5 +1,6 @@
 {{- if and .Values.clusterName .Values.clusterServer .Values.rbac.enabled }}
-{{- $name := printf "%s-argocd-sync" .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- /* Named from clusterName: every member's release shares one release name on the hub. */}}
+{{- $name := printf "kiali-%s-argocd-sync" .Values.clusterName | trunc 63 | trimSuffix "-" }}
 {{- range $ns := list .Values.esoNamespace .Values.kialiNamespace }}
 ---
 # Lets the Argo CD application controller manage the ESO CRs, Secrets, ServiceAccounts and
