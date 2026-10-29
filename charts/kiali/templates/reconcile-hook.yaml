@@ -1,0 +1,117 @@
+{{- if and (eq (include "kiali.mode" .) "hub") .Values.remoteClusters }}
+{{- /*
+  PostSync hook: wait until the remote cluster secret of every member in remoteClusters exists,
+  then set the hub Kiali CR's annotation kiali.io/reconcile to a hash of the member names and the
+  secrets' uids. The operator mounts remote secrets only when it reconciles, and an annotation change is
+  Red Hat's documented trigger; the same secrets give the same hash, so no extra reconcile.
+*/}}
+{{- $ns := .Values.kialiNamespace }}
+{{- $timeout := int .Values.reconcileHook.timeoutSeconds }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kiali-reconcile
+  namespace: {{ $ns | quote }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kiali-reconcile
+  namespace: {{ $ns | quote }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames:
+      {{- range .Values.remoteClusters }}
+      - {{ printf "kiali-remote-cluster-secret-%s" . | quote }}
+      {{- end }}
+  - apiGroups: ["kiali.io"]
+    resources: ["kialis"]
+    verbs: ["get", "patch"]
+    resourceNames: ["kiali"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kiali-reconcile
+  namespace: {{ $ns | quote }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kiali-reconcile
+subjects:
+  - kind: ServiceAccount
+    name: kiali-reconcile
+    namespace: {{ $ns | quote }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kiali-reconcile
+  namespace: {{ $ns | quote }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add $timeout 120 }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kiali-reconcile
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: kiali-reconcile
+      restartPolicy: Never
+      containers:
+        - name: reconcile
+          image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              NS={{ $ns | quote }}
+              MEMBERS=({{ range .Values.remoteClusters }} {{ . | quote }}{{ end }} )
+              deadline=$(( $(date +%s) + {{ $timeout }} ))
+              pairs=()
+              for m in "${MEMBERS[@]}"; do
+                secret="kiali-remote-cluster-secret-${m}"
+                uid=""
+                while :; do
+                  uid="$(oc get secret "$secret" -n "$NS" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+                  [ -n "$uid" ] && break
+                  if [ "$(date +%s)" -ge "$deadline" ]; then
+                    echo "Secret $secret is still missing in $NS after {{ $timeout }} s."
+                    echo "Check on the hub the ExternalSecrets kiali-kubeconfig-${m} (external-secrets-operator) and"
+                    echo "kiali-remote-${m} ($NS), and the Argo CD Application ${m}-hub-kiali-remote-secret."
+                    exit 1
+                  fi
+                  echo "Waiting for Secret $secret in $NS..."
+                  sleep 10
+                done
+                echo "Found $secret (uid $uid)."
+                pairs+=("${m}=${uid}")
+              done
+              hash="$(printf '%s\n' "${pairs[@]}" | sha256sum | cut -c1-16)"
+              echo "Setting kiali.io/reconcile=${hash} on Kiali kiali in $NS (the same secrets give the same value)."
+              oc annotate kialis.kiali.io kiali -n "$NS" --overwrite "kiali.io/reconcile=${hash}"
+{{- end }}

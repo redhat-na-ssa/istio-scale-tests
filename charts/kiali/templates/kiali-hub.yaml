@@ -1,0 +1,71 @@
+{{- if eq (include "kiali.mode" .) "hub" }}
+# The Kiali server on the hub, external deployment model: no Istio here, so it ignores this
+# cluster and reads each mesh member through the remote cluster secret that
+# charts/hub-kiali-remote-secret writes (label kiali.io/multiCluster=true). The operator mounts
+# those secrets when it reconciles; the PostSync hook (reconcile-hook.yaml) triggers that.
+apiVersion: kiali.io/v1alpha1
+kind: Kiali
+metadata:
+  name: kiali
+  namespace: {{ .Values.kialiNamespace | quote }}
+  annotations:
+    {{- if .Values.argoSyncWaves.enabled }}
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.kiali | quote }}
+    {{- end }}
+    # The CRD comes with the operator, earlier in the same sync.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+spec:
+  version: default
+  auth:
+    strategy: openshift
+  clustering:
+    ignore_home_cluster: true
+    autodetect_secrets:
+      enabled: true
+  {{- with .Values.clusterName }}
+  kubernetes_config:
+    cluster_name: {{ . | quote }}
+  {{- end }}
+  deployment:
+    view_only_mode: {{ include "kiali.viewOnly" . }}
+    {{- with .Values.server.discoverySelectors }}
+    discovery_selectors:
+      default:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    resources:
+      {{- toYaml .Values.server.resources | nindent 6 }}
+  external_services:
+    prometheus:
+      url: {{ required "prometheus.url is required" .Values.prometheus.url | quote }}
+      auth:
+        type: none
+      # Thanos holds downsampled data and receives a sample per collector push, so Kiali needs
+      # the push interval and the retention to build its queries.
+      thanos_proxy:
+        enabled: true
+        scrape_interval: {{ required "prometheus.scrapeInterval is required" .Values.prometheus.scrapeInterval | quote }}
+        retention_period: {{ required "prometheus.retentionPeriod is required" .Values.prometheus.retentionPeriod | quote }}
+    grafana:
+      enabled: false
+    tracing:
+      enabled: false
+---
+# The members the PostSync hook waits for (remoteClusters). Argo CD does not compare hooks, so
+# without this a new member list would leave hub-kiali Synced and never rerun the hook.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kiali-remote-clusters
+  namespace: {{ .Values.kialiNamespace | quote }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.kiali | quote }}
+  {{- end }}
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+data:
+  clusters: {{ join "," (.Values.remoteClusters | default list) | quote }}
+{{- end }}

@@ -1,0 +1,22 @@
+{{- $mode := include "kiali.mode" . }}
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: {{ .Values.subscription.name | quote }}
+  namespace: {{ .Values.operatorNamespace | quote }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.operator | quote }}
+  {{- end }}
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+spec:
+  channel: {{ .Values.subscription.channel | quote }}
+  name: {{ .Values.subscription.package | quote }}
+  source: {{ .Values.subscription.source | quote }}
+  sourceNamespace: {{ .Values.subscription.sourceNamespace | quote }}
+  installPlanApproval: {{ .Values.subscription.installPlanApproval | quote }}
+  {{- with .Values.subscription.startingCSV }}
+  # Pins the first install only (values.yaml).
+  startingCSV: {{ . | quote }}
+  {{- end }}

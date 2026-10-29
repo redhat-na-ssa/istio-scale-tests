@@ -3,9 +3,9 @@
 # the argo-cd chart: controller.appSync, .processors, .kubernetesShardingAlgorithm and
 # .resources, repo.replicas and .resources, server.resources, applicationSetResources,
 # resourceExclusions and resourceHealthChecks. The rest (name, applicationSet,
-# controller.sharding, controller.shardingAlgorithm) is the CR's only; on kubernetes the
-# controller replica count comes from argocd_clusters_per_shard, and each spoke's cluster Secret
-# pins its shard (terraform/platform/README.md).
+# controller.sharding, controller.shardingAlgorithm, kialiHealthCheck) is the CR's only; on
+# kubernetes the controller replica count comes from argocd_clusters_per_shard, and each spoke's
+# cluster Secret pins its shard (terraform/platform/README.md).
 argocd:
   name: openshift-gitops
   applicationSet:
@@ -134,3 +134,24 @@ argocd:
           end
         end
         return hs
+
+  # Health of the Kiali CR (kiali.io): Healthy once the Kiali operator reports Successful, so a
+  # later sync wave (a member's token Secret) waits for the ServiceAccount the operator creates.
+  # Added to resourceHealthChecks only when terraform/platform turns it on (kiali_multicluster,
+  # openshift only).
+  kialiHealthCheck:
+    enabled: false
+    check: |
+      hs = {status = "Progressing", message = "Waiting for the Kiali operator"}
+      if obj.status ~= nil and obj.status.conditions ~= nil then
+        for _, c in ipairs(obj.status.conditions) do
+          if c.type == "Failure" and c.status == "True" then
+            return {status = "Degraded", message = c.message or c.reason}
+          end
+          if c.type == "Successful" and c.status == "True" then
+            hs.status = "Healthy"
+            hs.message = c.message or "Successful"
+          end
+        end
+      end
+      return hs

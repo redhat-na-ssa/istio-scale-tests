@@ -1,0 +1,58 @@
+{{- /*
+  The Envoy proxies (sidecars and gateways) of this namespace. OpenShift user workload monitoring
+  ignores namespaceSelector, so every namespace gets its own. The relabelings are OSSM 3.4's
+  (Kiali v2.27's ACM page has the same): istio-proxy containers that carry prometheus.io/scrape,
+  scraped at the prometheus.io/port merged-metrics port, with app and version from the pod labels.
+  No mesh_id: one mesh. The namespace label comes from the monitor's own namespace.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: mesh-metrics-istio-proxies
+  namespace: {{ include "spoke-mesh-metrics.namespace" . | quote }}
+  labels:
+    {{- include "spoke-mesh-metrics.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.monitors | quote }}
+  {{- end }}
+spec:
+  selector:
+    matchExpressions:
+      - key: istio-prometheus-ignore
+        operator: DoesNotExist
+  podMetricsEndpoints:
+    - path: /stats/prometheus
+      interval: {{ .Values.scrapeInterval }}
+      relabelings:
+        - action: keep
+          sourceLabels: [__meta_kubernetes_pod_container_name]
+          regex: istio-proxy
+        - action: keep
+          sourceLabels: [__meta_kubernetes_pod_annotationpresent_prometheus_io_scrape]
+        - action: replace
+          regex: '(\d+);(([A-Fa-f0-9]{1,4}::?){1,7}[A-Fa-f0-9]{1,4})'
+          replacement: '[$2]:$1'
+          sourceLabels: [__meta_kubernetes_pod_annotation_prometheus_io_port, __meta_kubernetes_pod_ip]
+          targetLabel: __address__
+        - action: replace
+          regex: '(\d+);((([0-9]+?)(\.|$)){4})'
+          replacement: '$2:$1'
+          sourceLabels: [__meta_kubernetes_pod_annotation_prometheus_io_port, __meta_kubernetes_pod_ip]
+          targetLabel: __address__
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name, __meta_kubernetes_pod_label_app]
+          separator: ";"
+          regex: '(.+);.*|.*;(.+)'
+          replacement: '${1}${2}'
+          targetLabel: app
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_version, __meta_kubernetes_pod_label_version]
+          separator: ";"
+          regex: '(.+);.*|.*;(.+)'
+          replacement: '${1}${2}'
+          targetLabel: version
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: {{ include "spoke-mesh-metrics.keepRegex" (dict "list" .Values.proxyMetrics "key" "proxyMetrics") | quote }}
+          action: keep

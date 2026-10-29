@@ -127,3 +127,20 @@ variable "cluster_overrides" {
   default     = {}
   description = "Per-cluster overrides keyed by cluster name (e.g. cluster-001). Fields merge over cluster_defaults."
 }
+
+variable "acm_observability_bucket" {
+  type        = bool
+  default     = false
+  description = "Create the S3 bucket for ACM Observability's Thanos on the hub (cluster 1) and an IAM role its ServiceAccounts assume through the hub's OIDC provider (STS). terraform/platform reads both from this state when acm_observability is on. Destroy deletes the bucket with its contents."
+}
+
+variable "acm_observability_bucket_static_key" {
+  type        = bool
+  default     = false
+  description = "With acm_observability_bucket: also create an IAM user with an access key for the bucket, and have terraform/platform put the key in thanos.yaml instead of using the role. A fallback for when the Thanos pods get no web identity. The key is stored in this root's state."
+
+  validation {
+    condition     = !var.acm_observability_bucket_static_key || var.acm_observability_bucket
+    error_message = "acm_observability_bucket_static_key needs acm_observability_bucket = true."
+  }
+}

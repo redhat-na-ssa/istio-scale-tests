@@ -26,6 +26,9 @@ sets only what differs.
 | `values-mesh-wiring-verify.yaml` | `charts/mesh-wiring-verify` (installed by Terraform, which adds `expectedMembers` and `expectedClusters`) | each mesh member |
 | `values-mesh-verify.yaml` | `charts/mesh-verify` (via `charts/mesh-verify-appset.yaml`) | each mesh member |
 | `values-mesh-verify-gateway-api.yaml` | `charts/mesh-verify-gateway-api` (via `charts/mesh-verify-gateway-api-appset.yaml`; `valuesObject.workloadCluster`) | each mesh member |
+| `values-mesh-metrics.yaml` | `charts/spoke-mesh-metrics` (OpenShift add-on `acm_observability`; Terraform sets `namespaceMatrix.namespaces`) | each mesh member, one app per namespace (`namespaceMatrix`, `CreateNamespace`) |
+| `values-kiali.yaml` | `charts/kiali`, mode `remote` (OpenShift add-on `kiali_multicluster`; Terraform sets `valuesObject.hubRedirectBase`) | each mesh member |
+| `values-kiali-remote-secret.yaml` | `charts/hub-kiali-remote-secret` (OpenShift add-on `kiali_multicluster`) | hub, one app per member |
 
 `destination.mode: clusterName` targets each member cluster by name;
 `inClusterServer` targets the hub API and passes `clusterName`/`clusterServer` to the
@@ -33,6 +36,15 @@ child chart. Write a member's name as `{{clusterName}}`, in `template.source.hel
 or in a string of `template.source.helm.valuesObject` (the gate's preset passes its `clusterName`
 so): the template rewrites it to `{{name}}` for the `clusters` generator, and Argo CD fills it in
 for each member. Static values go in `template.source.helm.valuesObject`.
+
+`namespaceMatrix` adds a second dimension: with `enabled: true` the ApplicationSet makes one
+Application per mesh member and per namespace in `namespaceMatrix.namespaces` (a matrix of the
+member generator and a list generator with one `{targetNamespace: <ns>}` element per namespace).
+Write `{{targetNamespace}}` in `template.applicationNameSuffix`, `destination.namespace`, a helm
+parameter or a `valuesObject` string; Argo CD fills it in (`values-mesh-metrics.yaml` names its
+Applications `<member>-mesh-metrics-<namespace>`). Members only: the render fails with
+`inClusterGenerator`, without the member generator, with `destination.mode: inClusterServer` or
+with an empty list.
 
 ```bash
 helm template x charts/gitops-hub-ocm-placement-appset \

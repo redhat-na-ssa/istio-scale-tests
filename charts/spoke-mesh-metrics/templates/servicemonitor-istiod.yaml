@@ -1,0 +1,31 @@
+{{- if include "spoke-mesh-metrics.isIstioNamespace" . }}
+{{- /*
+  istiod's own metrics, for Kiali's control-plane views. targetLabels copies the Service's app
+  label (istiod) onto the series, as Kiali's queries expect.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mesh-metrics-istiod
+  namespace: {{ include "spoke-mesh-metrics.namespace" . | quote }}
+  labels:
+    {{- include "spoke-mesh-metrics.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.monitors | quote }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: istiod
+  targetLabels:
+    - app
+  endpoints:
+    - port: http-monitoring
+      path: /metrics
+      interval: {{ .Values.scrapeInterval }}
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: {{ include "spoke-mesh-metrics.keepRegex" (dict "list" .Values.istiodMetrics "key" "istiodMetrics") | quote }}
+          action: keep
+{{- end }}

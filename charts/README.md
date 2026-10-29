@@ -26,12 +26,22 @@ follows in parentheses.
 | 21 | `spoke-ossm-appset` | `spoke-ossm/` | each mesh member |
 | 24 | `spoke-ingress-gateway-appset` | `spoke-ingress-gateway/` | each mesh member |
 | 27 | `spoke-east-west-gateway-appset` | `spoke-east-west-gateway/` | each mesh member |
+| 30 | `spoke-mesh-metrics-appset` | `spoke-mesh-metrics/` (openshift add-on, off by default) | each mesh member, one per namespace |
+| 31 | `spoke-kiali-appset` | `kiali/`, mode `remote` (openshift add-on, off by default) | each mesh member |
+| 32 | `hub-kiali` | `kiali/`, mode `hub` (openshift add-on, off by default) | hub |
+| 33 | `hub-kiali-remote-secret-appset` | `hub-kiali-remote-secret/` (openshift add-on, off by default) | hub, one per member |
 
 Waves order creation only; they do not wait for a child to be healthy. The child and the
 generated per-cluster Applications retry a failed sync (10 tries, backoff up to 5 min), so
 one that needs a CRD from an earlier wave converges once that CRD exists.
 
 Skip a child Application with `apps.<name>.enabled=false` (see `gitops-hub-apps/`).
+
+Waves 30 to 33 are the OpenShift add-ons: `apps.<name>.enabled` is `false` for them, and
+`terraform/platform` turns them on with `acm_observability` (wave 30) and `kiali_multicluster`
+(31 to 33) and fills in their values
+([terraform/platform](../terraform/platform/README.md#openshift-add-ons-acm-observability-and-kiali)).
+They never render on `kubernetes`.
 
 ## All charts
 
@@ -41,6 +51,7 @@ Skip a child Application with `apps.<name>.enabled=false` (see `gitops-hub-apps/
 | `acm-managed-cluster/` | Terraform (openshift) | One ManagedCluster (+ ManagedServiceAccount) per spoke |
 | `acm-multicluster-hub/` | Terraform (openshift) | MultiClusterHub CR |
 | `acm-openshift-gitops-resources/` | Terraform (openshift) | ManagedClusterSet, binding and the mesh Placement |
+| `acm-observability/` | Terraform (openshift, `acm_observability`) | ACM Observability: the MultiClusterObservability (Thanos in object storage) and the hub's metrics allowlist |
 | `argocd-config/` | Terraform | Argo CD tuning (sharding, resources): its `values.yaml` feeds the `argo-cd` chart on kubernetes and the ArgoCD CR on openshift |
 | `gitops-hub-app-of-apps/` | Terraform | Root Application `hub-gitops-root` |
 | `gitops-hub-apps/` | app-of-apps | Child Applications (table above) |
@@ -60,6 +71,9 @@ Skip a child Application with `apps.<name>.enabled=false` (see `gitops-hub-apps/
 | `mesh-verify/` | `mesh-verify-appset.yaml` | Cross-cluster echo workload |
 | `mesh-verify-gateway-api/` | `mesh-verify-gateway-api-appset.yaml` | Gateway API ingress check: HTTPRoutes on every member, echo on one ([misc_tests/gateway-api](../misc_tests/gateway-api/README.md)) |
 | `istiod-monitor/` | manual `helm install` | ServiceMonitor + PrometheusRule for istiod |
+| `spoke-mesh-metrics/` | app-of-apps (openshift, `acm_observability`) | Per member and namespace: user workload monitoring, istiod ServiceMonitor, Envoy PodMonitor and the ACM metrics allowlist |
+| `kiali/` | app-of-apps (openshift, `kiali_multicluster`) | Kiali operator (OLM) and Kiali CR: the server on the hub (external deployment model), the resources it needs on each member |
+| `hub-kiali-remote-secret/` | app-of-apps (openshift, `kiali_multicluster`) | Kiali remote cluster secret per member on the hub (External Secrets, the member's read-only token) |
 
 `mesh-verify-appset.yaml` and `mesh-verify-gateway-api-appset.yaml` are standalone Applications
 (`kubectl apply -f -` / `kubectl delete -f -`). Both keep `<repo-url>`, `<revision>`, `<platform>`

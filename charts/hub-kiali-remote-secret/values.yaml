@@ -1,0 +1,46 @@
+# Set per member by the ApplicationSet (values-kiali-remote-secret.yaml, inClusterServer mode).
+# Without both the chart renders nothing.
+clusterName: ""
+clusterServer: ""
+
+# The ESO operand namespace on the hub: hop 1 (the member's token, read from the member) and the
+# member's kubeconfig Secret (charts/hub-kubeconfig-from-argosecret) live here.
+esoNamespace: external-secrets-operator
+
+# The hub Kiali's namespace (charts/kiali, mode hub): hop 2 writes the remote cluster secret here.
+kialiNamespace: istio-system
+
+# The member's token Secret (charts/kiali, mode remote).
+memberNamespace: istio-system
+memberTokenSecret: kiali-service-account
+
+# The hub's kubeconfig Secret of the member (charts/hub-kubeconfig-from-argosecret): its
+# bearer-token authenticates the member store (it never reaches Kiali) and its ca.crt is
+# copied into Kiali's kubeconfig. Empty: kubeconfig-<clusterName>.
+kubeconfigSourceSecretName: ""
+
+# true when the member's API certificate is signed by a public CA and the kubeconfig Secret
+# has no ca.crt (as charts/hub-mesh-push-secrets spokeSecretStore.skipCAProvider).
+memberSecretStore:
+  skipCAProvider: false
+
+refreshInterval: 5m
+
+# CA of the hub API for the two hub-local SecretStores.
+kubernetesAPI:
+  caFromConfigMap:
+    name: kube-root-ca.crt
+    key: ca.crt
+
+# Lets the Argo CD application controller manage the ESO CRs, Secrets and Roles.
+rbac:
+  enabled: true
+  argocd:
+    namespace: argocd
+    serviceAccountName: argocd-application-controller
+
+argoSyncWaves:
+  enabled: true
+  rbac: -30
+  secretStore: -25
+  externalSecret: 0

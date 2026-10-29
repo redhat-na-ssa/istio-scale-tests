@@ -189,6 +189,10 @@ rules: [Run config](../../docs/reference.md#run-config---config-file)).
 helm install istiod-monitor charts/istiod-monitor -n istio-system --kube-context <mesh-a-ctx>
 ```
 
+With the OpenShift add-on `acm_observability` on, the member already has user workload monitoring
+and an istiod ServiceMonitor ([`charts/spoke-mesh-metrics`](../../charts/spoke-mesh-metrics/README.md)),
+so install only the PrometheusRule: add `--set enableUserWorkloadMonitoring=false --set serviceMonitor.enabled=false`.
+
 ## Outputs
 
 Results go to `tests/propagation/results/` (a sweep uses `results/sweep-<RUN_ID>/`; change it with

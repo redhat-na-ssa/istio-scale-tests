@@ -79,7 +79,7 @@ locals {
   # an edited chart file would never roll out on apply.
   charts_dir = "${path.module}/../../charts"
   chart_checksum = { for c in [
-    "acm-klusterlet-config", "acm-managed-cluster", "acm-multicluster-hub",
+    "acm-klusterlet-config", "acm-managed-cluster", "acm-multicluster-hub", "acm-observability",
     "acm-openshift-gitops-resources", "argocd-config", "gitops-hub-app-of-apps",
     "gitops-hub-ocm-placement-appset",
     ] : c => sha1(join("", [for f in sort(fileset("${local.charts_dir}/${c}", "**")) : filesha1("${local.charts_dir}/${c}/${f}")]))

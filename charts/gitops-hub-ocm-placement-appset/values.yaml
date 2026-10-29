@@ -38,6 +38,15 @@ inClusterGenerator:
   enabled: false
   clusterName: in-cluster
 
+# Optional second dimension: one Application per mesh member AND per namespace in
+# namespaceMatrix.namespaces (a matrix of the member generator and a list generator whose
+# elements are {targetNamespace: <ns>}). Write {{targetNamespace}} in applicationNameSuffix,
+# destination.namespace, helm parameters or valuesObject strings; Argo CD fills it in. Members
+# only: not with inClusterGenerator or destination.mode inClusterServer.
+namespaceMatrix:
+  enabled: false
+  namespaces: []
+
 # generator clusterDecisionResource only. Created by Terraform
 # (kubernetes_manifest.placement_generator_configmap).
 generatorConfigMap:

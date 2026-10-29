@@ -1,0 +1,16 @@
+{{- if .Values.hubAllowlist.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observability-metrics-custom-allowlist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: acm-observability
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  metrics_list.yaml: |
+    matches:
+    {{- range .Values.hubAllowlist.matches }}
+      - {{ . | squote }}
+    {{- end }}
+{{- end }}

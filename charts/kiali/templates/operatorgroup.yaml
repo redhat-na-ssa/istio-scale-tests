@@ -1,0 +1,15 @@
+{{- $mode := include "kiali.mode" . }}
+# AllNamespaces: the operator reconciles the Kiali CR in kialiNamespace.
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: {{ .Values.operatorGroup.name | quote }}
+  namespace: {{ .Values.operatorNamespace | quote }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.operator | quote }}
+  {{- end }}
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+spec:
+  targetNamespaces: []

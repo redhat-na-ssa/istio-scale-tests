@@ -1,0 +1,21 @@
+{{- if and (include "spoke-mesh-metrics.isIstioNamespace" .) .Values.userWorkloadMonitoring.enabled }}
+{{- /*
+  User workload monitoring: ACM's uwl-metrics-collector reads the user-workload Prometheus, so it
+  comes first. Only enableUserWorkload: the MultiClusterObservability's mco-disable-alerting keeps
+  ACM's endpoint operator out of this ConfigMap, so Argo CD alone owns it.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+  labels:
+    {{- include "spoke-mesh-metrics.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.userWorkloadMonitoring | quote }}
+  {{- end }}
+data:
+  config.yaml: |
+    enableUserWorkload: true
+{{- end }}

@@ -1,12 +1,13 @@
 #!/usr/bin/env bats
 # The charts on both platforms (kubernetes by default, openshift through overlays): every
 # chart with a values-openshift.yaml renders both ways and its Kubernetes render never names
-# OpenShift; the ApplicationSet presets select the members by the cluster-Secret label in
-# argocd on kubernetes, and by the ACM Placement in openshift-gitops, with each member
-# chart's values-openshift.yaml (which must exist), on openshift; the app-of-apps hands its
-# children the platform's presets and operator sources; any other platform fails the render;
-# the gate's ApplicationSet, with Terraform's values, gives each member's gate the members' names
-# and its own on both platforms. Needs helm; skips without it.
+# OpenShift; the ApplicationSet presets select the members (alone, or per namespace in a matrix)
+# by the cluster-Secret label in argocd on kubernetes, and by the ACM Placement in
+# openshift-gitops, with each member chart's values-openshift.yaml (which must exist), on
+# openshift; the app-of-apps hands its children the platform's presets and operator sources;
+# any other platform fails the render; the gate's ApplicationSet, with Terraform's values, gives
+# each member's gate the members' names and its own on both platforms. Needs helm; skips
+# without it.
 
 bats_require_minimum_version 1.5.0
 load test_helper
@@ -16,10 +17,11 @@ REPO=(--set repo.url=https://example.invalid/istio-scale-tests.git --set repo.re
 # Member charts render only with a cluster name (the ApplicationSet sets it), the Gateway API
 # check also with its workload member; the other charts ignore both.
 MEMBER=(--set clusterName=member-a --set workloadCluster=member-a)
-# Charts that only the openshift platform installs (OLM), so their defaults are OpenShift's.
-OPENSHIFT_ONLY_CHARTS=" cert-manager-operator external-secrets-operator spoke-ossm-operator "
-# Presets that only the openshift platform uses (OLM).
-OPENSHIFT_ONLY_PRESETS=" values-ossm-operator.yaml values-external-secrets-olm.yaml "
+# Charts that only the openshift platform installs (OLM, the OpenShift add-ons), so their
+# defaults are OpenShift's.
+OPENSHIFT_ONLY_CHARTS=" cert-manager-operator external-secrets-operator spoke-ossm-operator kiali hub-kiali-remote-secret spoke-mesh-metrics "
+# Presets that only the openshift platform uses (OLM, the OpenShift add-ons).
+OPENSHIFT_ONLY_PRESETS=" values-ossm-operator.yaml values-external-secrets-olm.yaml values-kiali.yaml values-kiali-remote-secret.yaml values-mesh-metrics.yaml "
 
 setup() {
 	command -v helm >/dev/null 2>&1 || skip "helm not installed"
@@ -64,7 +66,12 @@ appset_render() {
 		grep -A3 '^kind: ApplicationSet' <<<"$k8s" | grep -q '  namespace: "argocd"' || { echo "$name: kubernetes ApplicationSet not in argocd"; false; }
 		grep -A3 '^kind: ApplicationSet' <<<"$ocp" | grep -q '  namespace: "openshift-gitops"' || { echo "$name: openshift ApplicationSet not in openshift-gitops"; false; }
 		! grep -q 'clusterDecisionResource' <<<"$k8s" || { echo "$name: kubernetes render uses the ACM generator"; false; }
-		if grep -q '^    - clusters:' <<<"$k8s"; then
+		if grep -q '^    - matrix:' <<<"$k8s"; then
+			# A member preset per namespace (namespaceMatrix): the same member generator, in a matrix.
+			grep -A3 '^          - clusters:' <<<"$k8s" | grep -q 'istio-mesh-member: "true"' || { echo "$name: kubernetes matrix without the istio-mesh-member clusters generator"; false; }
+			grep -q '^          - clusterDecisionResource:' <<<"$ocp" || { echo "$name: openshift matrix does not use the Placement"; false; }
+			grep -q 'cluster.open-cluster-management.io/placement: "acm-openshift-gitops-placement"' <<<"$ocp" || { echo "$name: openshift render not on the mesh Placement"; false; }
+		elif grep -q '^    - clusters:' <<<"$k8s"; then
 			# A member preset: the cluster-Secret label on kubernetes, the Placement on openshift.
 			grep -A3 '^    - clusters:' <<<"$k8s" | grep -q 'istio-mesh-member: "true"' || { echo "$name: kubernetes clusters generator without the istio-mesh-member selector"; false; }
 			grep -q '^    - clusterDecisionResource:' <<<"$ocp" || { echo "$name: openshift render does not use the Placement"; false; }

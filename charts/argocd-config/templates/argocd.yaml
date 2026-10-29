@@ -57,7 +57,12 @@ spec:
         {{- end }}
     {{- end }}
   {{- end }}
-  {{- with .Values.argocd.resourceHealthChecks }}
+  {{- $checks := .Values.argocd.resourceHealthChecks | default list }}
+  {{- $kiali := .Values.argocd.kialiHealthCheck | default dict }}
+  {{- if eq (toString $kiali.enabled) "true" }}
+  {{- $checks = append $checks (dict "group" "kiali.io" "kind" "Kiali" "check" $kiali.check) }}
+  {{- end }}
+  {{- with $checks }}
   resourceHealthChecks:
     {{- toYaml . | nindent 4 }}
   {{- end }}

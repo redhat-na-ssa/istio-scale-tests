@@ -49,6 +49,37 @@ the On-Demand Standard vCPU quota: the 21-cluster run needed 4000 vCPUs (request
 `rosa verify quota`, which wants at least 100 of those vCPUs (and 20 Classic LBs): a vCPU quota
 held lower on purpose, as the window plan does, fails that one check.
 
+## ACM Observability bucket (optional)
+
+The OpenShift add-on `acm_observability` of `terraform/platform` keeps ACM Observability's
+metrics (Thanos) in object storage. On ROSA, this root creates that storage. `<hub>` below is
+cluster 1 (the first cluster key), the ACM hub; the bucket prefix allows 28 characters for it.
+
+- `acm_observability_bucket = true`: an S3 bucket `<hub>-acm-obs-<suffix>` (public access
+  blocked, SSE-S3, `force_destroy`), an IAM policy `<hub>-acm-obs-s3` that only lists the bucket
+  and reads, writes and deletes its objects, and an IAM role `<hub>-acm-obs-s3` with that policy.
+  The Thanos ServiceAccounts (`open-cluster-management-observability/observability-thanos-*`)
+  assume the role through the hub's OIDC provider (STS), so no key is stored anywhere.
+- `acm_observability_bucket_static_key = true` (needs the first): also an IAM user
+  `<hub>-acm-obs-s3` with the same policy and an access key, which `terraform/platform` then puts
+  in `thanos.yaml` instead of using the role. A fallback for when the Thanos pods get no web
+  identity; the key is stored in this root's state.
+
+Outputs: `acm_observability_storage` (bucket, region, endpoint, role ARN, and `auth`: `sts` or
+`static`) and the sensitive `acm_observability_storage_credentials` (the static key, or null).
+`terraform/platform` reads both from this root's state.
+
+Apply this root with `acm_observability_bucket = true` first, then `terraform/platform` with
+`acm_observability.enabled = true` (see
+[OpenShift add-ons](../platform/README.md#openshift-add-ons-acm-observability-and-kiali)). Turn the
+add-on off in the platform before you turn the bucket off here.
+
+Destroy the platform first, as always: it deletes the MultiClusterObservability and waits until it
+is gone. `terraform destroy` here then deletes the bucket with everything in it (`force_destroy`),
+the role, the policy and the user. `003-auto-teardown.sh` removes the role with the clusters in its
+first step (the role depends on the hub's OIDC provider) and the rest in the full destroy; its audit
+reports a LEAK if a bucket `<hub>-acm-obs-*` or a role, user or policy `<hub>-acm-obs-s3` is left.
+
 ## Tear down
 
 Clusters bill hourly. Destroy the platform first, then:

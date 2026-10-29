@@ -1,0 +1,23 @@
+{{- /*
+  ACM's uwl-metrics-collector sends a namespace's user workload series to the hub only when this
+  namespace's allowlist names them. Exact names only: the same lists as the monitors' keep regexes.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observability-metrics-custom-allowlist
+  namespace: {{ include "spoke-mesh-metrics.namespace" . | quote }}
+  labels:
+    {{- include "spoke-mesh-metrics.labels" . | nindent 4 }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.monitors | quote }}
+  {{- end }}
+data:
+  uwl_metrics_list.yaml: |
+    names:
+    {{- range splitList "\n" (include "spoke-mesh-metrics.allowlistNames" .) }}
+    {{- if . }}
+      - {{ . }}
+    {{- end }}
+    {{- end }}

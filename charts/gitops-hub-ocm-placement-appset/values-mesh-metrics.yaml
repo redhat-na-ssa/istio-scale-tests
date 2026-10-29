@@ -1,0 +1,45 @@
+# Preset, OpenShift add-on (terraform/platform acm_observability): Istio metrics for ACM
+# Observability on every mesh member, one Application per member and per namespace in
+# namespaceMatrix.namespaces (Terraform sets the list). CreateNamespace, so a listed namespace
+# that does not exist yet (mesh-verify is on-demand) never fails the sync.
+identity:
+  component: spoke-mesh-metrics
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-spoke-mesh-metrics
+  roleBindingName: openshift-gitops-ocm-placement-spoke-mesh-metrics
+
+argocdApplicationControllerRbac:
+  roleName: gitops-spoke-mesh-metrics-appset-argocd-sync
+  roleBindingName: gitops-spoke-mesh-metrics-appset-argocd-sync
+
+applicationSet:
+  name: spoke-mesh-metrics
+
+destination:
+  mode: clusterName
+  namespace: "{{targetNamespace}}"
+
+namespaceMatrix:
+  enabled: true
+  namespaces:
+    - istio-system
+
+template:
+  applicationNameSuffix: "mesh-metrics-{{targetNamespace}}"
+  source:
+    path: charts/spoke-mesh-metrics
+    helm:
+      releaseName: mesh-metrics
+      parameters:
+        - name: clusterName
+          value: "{{clusterName}}"
+        - name: namespace
+          value: "{{targetNamespace}}"
+      # terraform/platform sets userWorkloadMonitoring.enabled (acm_observability
+      # enable_user_workload_monitoring).
+      valuesObject:
+        userWorkloadMonitoring:
+          enabled: true
+  syncOptions:
+    - CreateNamespace=true

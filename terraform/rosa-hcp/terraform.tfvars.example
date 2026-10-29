@@ -31,6 +31,12 @@ common_tags = {
 # route over the public internet instead).
 # vpc_peering_enabled = false
 
+# S3 bucket + IAM role (STS, trusted by the hub's OIDC provider) for ACM
+# Observability's Thanos, read by terraform/platform's acm_observability add-on.
+# acm_observability_bucket = true
+# Fallback: an IAM user's access key in thanos.yaml instead of the role.
+# acm_observability_bucket_static_key = true
+
 # Shared overrides for every cluster:
 # cluster_defaults = {
 #   replicas             = 2

@@ -32,3 +32,8 @@ output "mesh_member_spoke_keys" {
   description = "Spoke cluster keys labeled as Istio mesh members."
   value       = local.mesh_member_spoke_keys
 }
+
+output "kiali_url" {
+  description = "kiali_multicluster: the hub's Kiali (log in there, then once per member; null when off)."
+  value       = local.kiali_enabled ? "https://${local.kiali_hub_host}" : null
+}

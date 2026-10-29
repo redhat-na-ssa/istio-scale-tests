@@ -1,0 +1,39 @@
+# Content hash of this chart, set by terraform/platform so an edit rolls out on apply.
+chartChecksum: ""
+
+mco:
+  name: observability
+  # Seconds between the metrics collectors' pushes (ACM minimum 15). Kiali's
+  # thanos_proxy.scrape_interval must equal it (charts/kiali prometheus.scrapeInterval).
+  interval: 60
+  # Thanos retention of raw, 5m and 1h data; Kiali's thanos_proxy.retention_period.
+  retention: 14d
+  # Empty: the cluster's default StorageClass (gp3-csi on ROSA).
+  storageClass: ""
+  # Set only at the first create (later changes need volume expansion).
+  storageSizes:
+    alertmanager: 1Gi
+    compact: 20Gi
+    receive: 20Gi
+    rule: 1Gi
+    store: 10Gi
+  # Created by terraform/platform: thanos.yaml (bucket, endpoint; keys only in static mode).
+  objectStorageSecret:
+    name: thanos-object-storage
+    key: thanos.yaml
+  # Created by terraform/platform: a copy of the hub's openshift-config/pull-secret.
+  imagePullSecret: multiclusterhub-operator-pull-secret
+  # STS (terraform/rosa-hcp): the IAM role the Thanos ServiceAccounts assume. Empty when
+  # thanos.yaml holds static keys.
+  roleArn: ""
+  # Merged over the chart's spec.advanced (retentionConfig, STS annotations).
+  advanced: {}
+
+# The custom allowlist in open-cluster-management-observability (metrics_list.yaml): platform
+# metrics every cluster's collector sends on top of ACM's default list. Kiali's control-plane
+# panels read istiod's container CPU from it. The Istio metrics' allowlists are per namespace on
+# the members (charts/spoke-mesh-metrics).
+hubAllowlist:
+  enabled: true
+  matches:
+    - __name__="container_cpu_usage_seconds_total",namespace="istio-system"

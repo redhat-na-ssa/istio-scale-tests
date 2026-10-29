@@ -1,0 +1,40 @@
+{{- if and (include "gitops-hub-apps.enabled" (dict "root" $ "name" "spoke-mesh-metrics-appset")) (eq (include "gitops-hub-apps.platform" .) "openshift") }}
+# ApplicationSet, OpenShift add-on (acm_observability): Istio metrics for ACM Observability on
+# each mesh member, one Application per member and namespace (charts/spoke-mesh-metrics).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spoke-mesh-metrics-appset
+  namespace: {{ .Values.gitopsNamespace | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "30"
+  labels:
+    app.kubernetes.io/name: gitops-hub-apps
+    app.kubernetes.io/component: spoke-mesh-metrics-appset
+spec:
+  project: default
+  source:
+    repoURL: {{ include "gitops-hub-apps.repoURL" . }}
+    targetRevision: {{ include "gitops-hub-apps.revision" . }}
+    path: charts/gitops-hub-ocm-placement-appset
+    helm:
+      releaseName: gitops-spoke-mesh-metrics-appset
+      {{- with include "gitops-hub-apps.valuesObject" (dict "root" $ "name" "spoke-mesh-metrics-appset") }}{{ . | nindent 6 }}{{- end }}
+      valueFiles:
+        - values-mesh-metrics.yaml
+        - platform-openshift.yaml
+      parameters:
+        - name: repo.url
+          value: {{ include "gitops-hub-apps.repoURL" . }}
+        - name: repo.revision
+          value: {{ include "gitops-hub-apps.revision" . }}
+        - name: placement.name
+          value: acm-openshift-gitops-placement
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.gitopsNamespace | quote }}
+  syncPolicy:
+    {{- include "gitops-hub-apps.syncPolicy" . | nindent 4 }}
+{{- end }}

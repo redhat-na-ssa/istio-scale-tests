@@ -50,7 +50,8 @@ validation window. Order:
      Skipped when no VPC is known (no saved copy, no aws_vpc in state).
   3. terraform destroy: VPCs, NAT gateways, Elastic IPs, peering.
      Steps 2-3 repeat (DependencyViolation) up to --retries rounds.
-  4. Read-only audit: terraform state, 'rosa list clusters', the saved VPCs, and
+  4. Read-only audit: terraform state, 'rosa list clusters', the saved VPCs, the
+     ACM Observability bucket and IAM role, user and policy (by name), and
      unattached EBS volumes created since T0. Exit 1 if anything still bills or
      cannot be checked.
 Every terraform attempt first refreshes the OCM token for the rhcs provider
@@ -521,9 +522,26 @@ with_retries() {
   return 1
 }
 
+# audit_count <what> <aws args...>: the aws query prints how many of <what> still exist.
+# 0 is OK; any other number is a LEAK; anything else (an error) is a LEAK? to check by hand.
+audit_count() {
+  local what="$1" n
+  shift
+  n="$(aws "$@" 2>/dev/null)" || n=""
+  if [[ "${n}" == "0" ]]; then
+    check_ok "no ${what}"
+  elif [[ "${n}" =~ ^[0-9]+$ ]]; then
+    log "  LEAK  ${what}: ${n} left"
+    AUDIT_LEAKS=$((AUDIT_LEAKS + 1))
+  else
+    log "  LEAK? ${what}: lookup failed: check by hand"
+    AUDIT_LEAKS=$((AUDIT_LEAKS + 1))
+  fi
+}
+
 AUDIT_LEAKS=0
 audit() {
-  local t0 t0iso names vpc err count others
+  local t0 t0iso names vpc err count others hub
   AUDIT_LEAKS=0
   log "Audit (region ${REGION:-unknown})"
   state_scan
@@ -570,6 +588,21 @@ audit() {
       AUDIT_LEAKS=$((AUDIT_LEAKS + 1))
     fi
   done < <(jq -r '.[]? | .vpc_id? // empty' "${BY_CLUSTER_JSON}" 2>/dev/null || true)
+  # acm_observability_bucket (s3_observability.tf), by name: the hub is the first cluster key.
+  hub="$(jq -r '[.[]? | .cluster_name? // empty] | sort | .[0] // empty' "${BY_CLUSTER_JSON}" 2>/dev/null)" || hub=""
+  if [[ -z "${hub}" ]]; then
+    check_info "no saved cluster names: the ACM Observability bucket and IAM checks are skipped"
+  elif [[ ! "${hub}" =~ ^[A-Za-z0-9-]+$ ]]; then
+    log "  LEAK? hub cluster name '${hub}' is not a plain name: check the ACM Observability bucket and IAM by hand"
+    AUDIT_LEAKS=$((AUDIT_LEAKS + 1))
+  else
+    audit_count "S3 bucket ${hub}-acm-obs-* (ACM Observability)" --region "${REGION}" s3api list-buckets \
+      --query "length(Buckets[?starts_with(Name, '${hub}-acm-obs-')])" --output text
+    audit_count "IAM role ${hub}-acm-obs-s3" iam list-roles --query "length(Roles[?RoleName=='${hub}-acm-obs-s3'])" --output text
+    audit_count "IAM user ${hub}-acm-obs-s3" iam list-users --query "length(Users[?UserName=='${hub}-acm-obs-s3'])" --output text
+    audit_count "IAM policy ${hub}-acm-obs-s3" iam list-policies --scope Local \
+      --query "length(Policies[?PolicyName=='${hub}-acm-obs-s3'])" --output text
+  fi
   if t0="$(read_t0)"; then
     t0iso="$(fmt_utc "${t0}" '%Y-%m-%dT%H:%M:%S')"
     if count="$(aws --region "${REGION}" ec2 describe-volumes --filters Name=status,Values=available --output json 2>/dev/null |

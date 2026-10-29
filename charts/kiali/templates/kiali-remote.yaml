@@ -1,0 +1,30 @@
+{{- if eq (include "kiali.mode" .) "remote" }}
+# On a mesh member: no Kiali server, only what the hub's Kiali needs here: the ServiceAccount
+# kiali-service-account (read-only kiali-viewer role with viewOnly), its roles and the
+# OAuthClient kiali-istio-system whose redirect URI is the hub's callback for this member.
+apiVersion: kiali.io/v1alpha1
+kind: Kiali
+metadata:
+  name: kiali
+  namespace: {{ .Values.kialiNamespace | quote }}
+  annotations:
+    {{- if .Values.argoSyncWaves.enabled }}
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.kiali | quote }}
+    {{- end }}
+    # The CRD comes with the operator, earlier in the same sync.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+spec:
+  version: default
+  auth:
+    strategy: openshift
+    openshift:
+      # The hub's Kiali uses the first entry. It ends with the member's cluster name, which is
+      # also its remote secret's data key and its Istio clusterName.
+      redirect_uris:
+        - {{ printf "%s/%s" (trimSuffix "/" .Values.hubRedirectBase) .Values.clusterName | quote }}
+  deployment:
+    remote_cluster_resources_only: true
+    view_only_mode: {{ include "kiali.viewOnly" . }}
+{{- end }}

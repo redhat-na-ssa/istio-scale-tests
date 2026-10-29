@@ -330,6 +330,14 @@ resource "helm_release" "argocd_config" {
       name  = "argocd.applicationSet.sourceNamespaces[${i}]"
       value = ns
     }],
+    # The Kiali CR's health check, so a member's token Secret syncs only once the Kiali
+    # operator has created its ServiceAccount (kiali_multicluster; nothing changes when off).
+    local.kiali_enabled ? [
+      {
+        name  = "argocd.kialiHealthCheck.enabled"
+        value = "true"
+      },
+    ] : [],
   )
 
   depends_on = [time_sleep.wait_argocd_stabilized]
@@ -534,19 +542,32 @@ resource "helm_release" "gitops_hub_app_of_apps" {
 
   # Provider defaults come as their own values document BEFORE the user overrides, so
   # Helm deep-merges an override of the same app into them (Terraform's merge() is
-  # shallow, and a later -var-file replaces the whole gitops_app_overrides map).
-  values = [yamlencode({
-    platform        = local.platform
-    gitopsNamespace = local.gitops_namespace
-    repo = {
-      url      = var.gitops_app_repo_url
-      revision = var.gitops_app_repo_revision
-    }
-    }), yamlencode({ apps = local.provider_app_defaults }),
-    yamlencode({ apps = var.gitops_app_overrides }),
-  yamlencode({ chartChecksum = local.chart_checksum["gitops-hub-app-of-apps"] })]
+  # shallow, and a later -var-file replaces the whole gitops_app_overrides map). The OpenShift
+  # add-ons' apps (acm_observability, kiali_multicluster) follow as one more document, also
+  # before the overrides, and only when one is on: with both off the values are unchanged.
+  values = concat(
+    [yamlencode({
+      platform        = local.platform
+      gitopsNamespace = local.gitops_namespace
+      repo = {
+        url      = var.gitops_app_repo_url
+        revision = var.gitops_app_repo_revision
+      }
+    }), yamlencode({ apps = local.provider_app_defaults })],
+    length(local.addon_app_defaults) > 0 ? [yamlencode({ apps = local.addon_app_defaults })] : [],
+    [yamlencode({ apps = var.gitops_app_overrides }),
+    yamlencode({ chartChecksum = local.chart_checksum["gitops-hub-app-of-apps"] })],
+  )
 
-  depends_on = [helm_release.acm_gitops_resources, helm_release.argocd, kubernetes_manifest.gitops_repo_credentials]
+  # The add-ons' cleanup resources: on destroy (or when an add-on is turned off) they run after
+  # this release no longer renders their apps.
+  depends_on = [
+    helm_release.acm_gitops_resources,
+    helm_release.argocd,
+    kubernetes_manifest.gitops_repo_credentials,
+    terraform_data.kiali_app_cleanup,
+    terraform_data.mesh_metrics_app_cleanup,
+  ]
 }
 
 # --- Mesh-wiring health gate ApplicationSet ---
@@ -924,6 +945,7 @@ resource "terraform_data" "argocd_app_cleanup" {
     helm_release.gitops_hub_app_of_apps,
     terraform_data.spoke_ossm_csv_cleanup,
     terraform_data.spoke_access_cleanup,
+    terraform_data.kiali_cr_cleanup,
   ]
 
   provisioner "local-exec" {

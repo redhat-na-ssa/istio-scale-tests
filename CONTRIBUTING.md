@@ -70,6 +70,10 @@ which wins over the upstream docs there when they disagree.
     `charts/spoke-ossm/values.yaml` and both gateways' `waitForIstiod.image`, each with a
     keep-in-sync comment naming the others (`charts/spoke-east-west-gateway/README.md` repeats it)
   - ACM/GitOps channels (OpenShift): `terraform/platform/variables.tf`
+  - the OpenShift add-ons: the Kiali operator's channel and `startingCSV` (`kiali-ossm`, `stable`,
+    `kiali-operator.v2.27.5`): `charts/kiali/values.yaml`, kept with the OSSM channel (the Kiali
+    that OSSM release ships); the MultiClusterObservability API (`v1beta2`):
+    `charts/acm-observability`
   - test images and the `ISTIO_VERSION` pin: `config/versions.env`, with a
     keep-in-sync comment next to each duplicated value (chart image tags, `istioVersion`);
     `tests/lib/test/version-pins.bats` fails when they drift. Results record the version the
@@ -121,12 +125,14 @@ which wins over the upstream docs there when they disagree.
 | `config/versions.env`, `config/options.env` | Test image pins, `ISTIO_VERSION`, `SETUP_CONTEXTS`; suite defaults and the env-only keys `ISTIO_VERSION_CHECK`, `ISTIO_VERSION_READY_WAIT_SEC`, `SWEEP_STOP_GRACE_SEC` |
 | `terraform/rosa-hcp/` | ROSA clusters; `scripts/001-preflight.sh` (account checks), `scripts/002-pre-destroy-vpc-cleanup.sh` |
 | `terraform/platform/` | Argo CD (ACM and OpenShift GitOps on OpenShift), spoke registration, app-of-apps, mesh-wiring gate; `scripts/001-openapi-preflight.sh` (OpenShift hubs), `scripts/002-plan-leftover-check.sh` (objects a saved plan creates that exist on the hub) |
-| `terraform/scripts/` | `local-exec` helpers (OAuth token, Argo cluster secrets, CSV and app cleanup on destroy; `argocd-controller-reshard.sh`: the OpenShift controller restart and the apply's Application status check; `olm-subscription-wait.sh`: an OLM operator install, naming what blocks it) |
+| `terraform/scripts/` | `local-exec` helpers (OAuth token, Argo cluster secrets, CSV and app cleanup on destroy, the ACM Observability delete wait; `argocd-controller-reshard.sh`: the OpenShift controller restart and the apply's Application status check; `olm-subscription-wait.sh`: an OLM operator install, naming what blocks it) |
 | `charts/gitops-hub-app-of-apps/` | Root Application `hub-gitops-root` (Helm source on `charts/gitops-hub-apps`) |
 | `charts/gitops-hub-apps/` | Child Applications (repo URL/branch templated; `apps.<name>.enabled/values`) |
 | `charts/gitops-hub-ocm-placement-appset/` | Reusable ApplicationSet + presets `values-*.yaml` + platform overlays `platform-*.yaml` (cluster-Secret label or ACM Placement) |
 | `charts/argocd-config/` | Argo CD tuning (sharding, resources, exclusions, Sail Istio/IstioCNI health checks): the `argo-cd` chart's values on Kubernetes, the ArgoCD CR on OpenShift |
 | `charts/acm-*` | OpenShift only: MultiClusterHub, KlusterletConfig, ManagedCluster, ClusterSet binding + Placement |
+| `charts/acm-observability/` | OpenShift add-on `acm_observability` (off by default), installed by Terraform: the MultiClusterObservability and the hub's metrics allowlist |
+| `charts/kiali/`, `charts/hub-kiali-remote-secret/` | OpenShift add-on `kiali_multicluster` (off by default): Kiali on the hub and its operator plus a remote Kiali CR on each member (`mode` `hub` or `remote`); the members' Kiali kubeconfigs on the hub (ESO) |
 | `charts/cert-manager-operator/`, `charts/external-secrets-operator/` | Hub operators through OLM (OpenShift); Kubernetes uses the upstream charts |
 | `charts/hub-mesh-ca/`, `charts/hub-mesh-ca-intermediate/` | Shared root CA and per-member intermediates |
 | `charts/hub-kubeconfig-from-argosecret/`, `charts/hub-mesh-push-secrets/` | ESO: member kubeconfigs on the hub; push `cacerts` + Istio remote secrets |
@@ -136,6 +142,7 @@ which wins over the upstream docs there when they disagree.
 | `charts/mesh-verify/`, `charts/mesh-verify-appset.yaml` | On-demand cross-cluster echo check |
 | `charts/mesh-verify-gateway-api/`, `charts/mesh-verify-gateway-api-appset.yaml` | On-demand Gateway API check: HTTPRoutes on every member, echo workload on one (`misc_tests/gateway-api`) |
 | `charts/istiod-monitor/` | Optional ServiceMonitor + recording rules for istiod |
+| `charts/spoke-mesh-metrics/` | OpenShift add-on `acm_observability`: user workload monitoring, istiod and Envoy monitors and the ACM allowlist, one Application per member and namespace |
 | `tests/<suite>/` | Numbered scripts + `chart/` (its `values-openshift.yaml` is added on OpenShift members by `tests/lib/platform.sh`; all but tuning also `configs/`, example run configs); see each suite README |
 | `misc_tests/gateway-api/` | One-off Gateway API ingress check, not a scale suite: `001-run-ingress-check.sh` + `configs/`; deploys `charts/mesh-verify-gateway-api` from the hub |
 | `tests/campaign/` | `001-run-profile.sh`: runs the preflight and the suites unattended from one profile per environment (`profiles/kind`, `openshift`, `rosa`: `profile.env` with the `CAMPAIGN_*` keys, plus a run config per suite); `campaign-<RUN_ID>.md`. Not a suite: no chart |

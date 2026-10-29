@@ -7,6 +7,7 @@ validated on the existing-cluster lab
 and the ROSA validation window of 2026-10-14 (tasks 1, 3, 4, 6), which also queued the fixes in
 section 9 ([`docs/campaigns/2026-10-14-rosa-validation/README.md`](docs/campaigns/2026-10-14-rosa-validation/README.md)).
 A second ROSA window on 2026-10-16 validated those fixes (section 9, "Validated on ROSA").
+Section 10 (2026-10-29) is built and checked offline, not yet run on a cluster.
 The original issue texts are in the appendix.
 
 | # | Task | Status | Left / validate on |
@@ -20,6 +21,7 @@ The original issue texts are in the appendix.
 | 7 | Shared `--config FILE` library (was #91) | Done for controlplane, dataplane, churn, churn-dataplane, propagation | tuning suite (follow-up) |
 | 8 | Gateway API multicluster ingress check: does an HTTPRoute need its Service (or its namespace) in every member? | Done, lab-validated 2026-10-14 (22/22 predictions matched) | — |
 | 9 | Fixes from the 2026-10-14 ROSA window (17 issues → 12 items) | All 12 implemented 2026-10-16 and validated on ROSA the same day (9.1, 9.2, 9.7, 9.8, 9.9, 9.11; 9.4 recalibrated); two follow-ups fixed (9.1's status check, 9.4's factor); east-west limit raised to 5Gi (owner, 9.9) | owner: results backup destination |
+| 10 | Multicluster Kiali on the ACM hub, fed by ACM Observability (OpenShift add-on, off by default) | Built 2026-10-29 (charts, Terraform, destroy helpers, bats); not validated live | ROSA: live validation (design section 8); deferred items in section 10 |
 
 ## 1. Namespace scaling factor
 
@@ -681,6 +683,69 @@ came back empty. Results (gitignored) are in the operator host's window archive.
 The 63-field header, the missing east-west HPA, `--mem-guard-contexts`, the retire check and the
 gateway resets are now listed at the top of
 [`window-plan.md`](docs/runbooks/rosa-validation/window-plan.md).
+
+## 10. Multicluster Kiali on the ACM hub (OpenShift add-on) — built, not validated live
+
+**Question:** can one Kiali on the ACM hub show every mesh member (workloads, Istio config, the
+traffic graph and metrics) without changing the mesh's tuning baseline or what the suites measure?
+
+**Done (2026-10-29):** built from the design in
+[`docs/design/kiali-acm-multicluster.md`](docs/design/kiali-acm-multicluster.md) (its "As built"
+note lists where the build differs). Two `terraform/platform` toggles, both off by default and
+OpenShift only
+([`terraform/platform/README.md`](terraform/platform/README.md#openshift-add-ons-acm-observability-and-kiali)):
+- `acm_observability`: ACM Observability on the hub (`charts/acm-observability`: classic
+  collector, Thanos in S3 from `terraform/rosa-hcp`'s `acm_observability_bucket` with STS or a
+  static key, 60 s collection interval, 14d retention, default size, `mco-disable-alerting`), and on
+  each member `charts/spoke-mesh-metrics` for every namespace in
+  `acm_observability.istio_metrics_namespaces` (default `istio-system` and the three mesh-verify
+  namespaces): user workload monitoring, the istiod and Envoy monitors and the ACM allowlist.
+- `kiali_multicluster`: Kiali 2.27.5 (`kiali-ossm`) on the hub in the external deployment model,
+  `openshift` login (once on the hub, then once per member), view-only by default; on each member
+  the Kiali operator and a remote Kiali CR with its token Secret, copied to the hub by External
+  Secrets (`charts/hub-kiali-remote-secret`); a PostSync hook re-reconciles the hub's Kiali once
+  every member's secret exists.
+- Destroy: `terraform/scripts/acm-observability-delete-wait.sh`, an `APP_NAMES` mode in
+  `argocd-app-cleanup.sh` (turning a toggle off deletes its Applications), `DELETE_CRS` in
+  `cleanup-olm-csv.sh`; the ROSA teardown audit also checks the bucket, role, user and policy.
+- bats: `spoke-mesh-metrics.bats`, `kiali-addon.bats`, `chart-platforms.bats` (OpenShift-only
+  lists, the namespace matrix), the destroy helpers' bats and `rosa-teardown.bats`.
+
+**Validated:** offline only (bats, `helm template`, `terraform validate`). Nothing has run on a
+cluster, and no sidecar workload runs there yet, so the metrics path is unproven.
+
+**Left:**
+- **Live validation** on ROSA per the design's section 8: storage and STS (the Thanos pods get a
+  web identity, else the static key), the MCO Ready and every ObservabilityAddon Available, member
+  series on the hub (`count(up) by (cluster)`), the hub's three remote secrets and the four logins,
+  cross-cluster graph edges from mesh-verify traffic, hub and member load after an hour, and a clean
+  teardown (toggles off, then a full destroy and the audit). Record the numbers here.
+- **Assumptions to check in that run** (from the offline build, not yet seen on a cluster):
+  External Secrets' hop 1 reads `ca.crt` through a second store (`data[].sourceRef.storeRef`) and
+  leaves `certificate-authority-data` out when it is empty; the Kiali CR health check turns
+  Healthy after a reconcile that first failed; the OpenShift GitOps controller can create the hub
+  hook Roles (`kiali-reconcile`, `kiali-cleanup`) through the chart's `rbac-argocd` Roles; the
+  `ose-cli` hook image has `sha256sum`; Thanos in STS mode needs no `region` in `thanos.yaml`;
+  Applications `<member>-mesh-metrics-<namespace>` longer than 63 characters sync; and the
+  PodMonitor's `annotationpresent_prometheus_io_scrape` keep, as the OSSM docs write it, filters
+  nothing (`regex: "true"` would make it real).
+- **Kiali version drift:** `kiali-ossm` has no per-minor channel, so with Automatic approval on
+  `stable` OLM moves past 2.27.5 when a newer CSV ships. Manual approval in `kiali-operator`, with
+  an approval step, would hold it at the version OSSM ships.
+- **Single login:** OpenShift OAuth has no single sign-on across clusters. Kiali's impersonation
+  (one login) needs Kiali 2.30 or later: switch to it when OSSM ships it.
+- **mTLS query path:** Kiali reads the hub's in-cluster Thanos query-frontend (`:9090`), which has
+  no authentication and serves every cluster's metrics. The Observatorium API with mutual TLS
+  (External Secrets can sync the rotating `observability-grafana-certs`) is the hardening step.
+- **MCOA:** the multicluster observability add-on with the Cluster Observability Operator (a scrape
+  interval per job, Istio series aggregated on each member) is the forward path; its Kiali recipe
+  is documented only from Kiali 2.33.
+- **Suite namespaces at scale:** a `kialiMetrics` toggle in the suite charts (`tests/*/chart`)
+  needs the six-lens review ([`docs/scale-test-team/`](docs/scale-test-team/README.md)): it adds
+  scraping during a measurement. It also needs a series budget: raw per-pod Istio histograms across
+  the members can exceed the default MCO size's rating of 200k active series.
+- **Platform record:** a line in `tests/lib/platform.sh` that records the add-on, so a run with the
+  extra scraping is labelled.
 
 ## Follow-ups found during the 2026-10-13 work
 

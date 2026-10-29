@@ -46,3 +46,13 @@ apps:
     enabled: true
   spoke-east-west-gateway-appset:
     enabled: true
+  # OpenShift add-ons, off by default: terraform/platform turns them on (acm_observability,
+  # kiali_multicluster) and fills in their values. Never rendered on kubernetes.
+  spoke-mesh-metrics-appset:
+    enabled: false
+  spoke-kiali-appset:
+    enabled: false
+  hub-kiali:
+    enabled: false
+  hub-kiali-remote-secret-appset:
+    enabled: false
