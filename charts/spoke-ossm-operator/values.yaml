@@ -3,7 +3,8 @@ operatorNamespace: openshift-operators
 subscription:
   name: servicemeshoperator3
   # Pinned minor channel. Each OSSM minor supports one Istio minor:
-  # stable-3.4 serves Istio v1.30.x (charts/spoke-ossm istioVersion).
+  # stable-3.4 serves Istio v1.30.x (charts/spoke-ossm istioVersion). Keep in sync: the Kiali that
+  # this minor ships (charts/kiali subscription.startingCSV).
   channel: stable-3.4
   package: servicemeshoperator3
   source: redhat-operators

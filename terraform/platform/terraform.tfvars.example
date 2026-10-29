@@ -103,6 +103,30 @@ spoke_cluster_contexts = ["<mesh-a-ctx>", "<mesh-b-ctx>"]
 # Application.
 # argocd_app_status_timeout_sec                   = 900   # 0 disables the check, else >= 600
 
+# --- OpenShift add-ons (off by default; README.md, "OpenShift add-ons") ---
+# ACM Observability on the hub (Thanos in object storage) and the members' Istio metrics, and one
+# Kiali on the hub for every member. Keep them off while a suite measures.
+# rosa: apply terraform/rosa-hcp with acm_observability_bucket = true first (the Thanos bucket).
+# kubeconfig: pass the bucket's thanos.yaml (ACM Observability docs) in an environment variable:
+#   export TF_VAR_acm_observability_object_storage="$(cat thanos.yaml)"
+# acm_observability = {
+#   enabled                         = true
+#   interval_sec                    = 60    # also Kiali's scrape interval
+#   retention                       = "14d" # also Kiali's retention period
+#   storage_class                   = ""    # the default StorageClass
+#   # istio-system is required; add your own test namespaces (never mesh-verify-gwapi-remote).
+#   istio_metrics_namespaces        = ["istio-system", "mesh-verify", "mesh-verify-gwapi", "mesh-verify-gwapi-shared", "<my-test-ns>"]
+#   enable_user_workload_monitoring = true  # false where a member has cluster-monitoring-config already
+# }
+# kiali_multicluster = {
+#   enabled   = true
+#   view_only = true
+# }
+# Extra values for charts/acm-observability, e.g. smaller Thanos receive requests:
+# acm_observability_values = {
+#   mco = { advanced = { receive = { resources = { requests = { cpu = "500m", memory = "2Gi" } } } } }
+# }
+
 # --- Versions (defaults track the tested versions) ---
 # argocd_chart_version    = "10.9.6"         # kubernetes: the argo-cd chart (keep in sync: variables.tf)
 # argocd_chart_repository = "https://argoproj.github.io/argo-helm"   # or a mirror

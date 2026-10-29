@@ -1,6 +1,6 @@
 ---
 name: istio-scale-tests
-last_updated: 2026-10-18
+last_updated: 2026-10-29
 ---
 
 # istio-scale-tests Strategy
@@ -28,7 +28,7 @@ A full-lifecycle harness — provision, test, tune, report — where users can e
 
 ### Provisioning
 
-Automated mesh standup on existing Kubernetes clusters through a kubeconfig (`cluster_provider = "kubeconfig"`), with a kind runbook that builds the clusters on one machine. OpenShift is an optional profile: existing clusters, or new ROSA HCP ones from zero.
+Automated mesh standup on existing Kubernetes clusters through a kubeconfig (`cluster_provider = "kubeconfig"`), with a kind runbook that builds the clusters on one machine. OpenShift is an optional profile: existing clusters, or new ROSA HCP ones from zero. On OpenShift an add-on, off by default, runs one Kiali on the hub for every member, fed by ACM Observability; it stays off while a suite measures, because its scraping loads the members.
 
 _Why it serves the approach:_ The harness can't be full-lifecycle if the user has to manually build clusters before they can start.
 
@@ -53,4 +53,4 @@ _Why it serves the approach:_ Without clear reports, test results stay locked in
 ## Not working on
 
 - Ambient mesh support
-- Integration with external observability products (OpenTelemetry, Kiali); Prometheus support is limited to the optional `charts/istiod-monitor` ServiceMonitor and PrometheusRule
+- Integration with external observability products (OpenTelemetry); Prometheus support is limited to the optional `charts/istiod-monitor` ServiceMonitor and PrometheusRule, and to the metrics the OpenShift Kiali add-on reads

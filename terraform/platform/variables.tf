@@ -320,6 +320,97 @@ variable "gitops_managed_service_account_name" {
 }
 
 # --------------------------------------------------------------------------
+# OpenShift add-ons (off by default): ACM Observability and multicluster Kiali
+# --------------------------------------------------------------------------
+
+variable "acm_observability" {
+  type = object({
+    enabled                         = optional(bool, false)
+    interval_sec                    = optional(number, 60)
+    retention                       = optional(string, "14d")
+    storage_class                   = optional(string, "")
+    istio_metrics_namespaces        = optional(list(string), ["istio-system", "mesh-verify", "mesh-verify-gwapi", "mesh-verify-gwapi-shared"])
+    enable_user_workload_monitoring = optional(bool, true)
+  })
+  default     = {}
+  nullable    = false
+  description = "platform openshift: ACM Observability on the hub and the mesh members' Istio metrics, which Kiali's graph and metrics read (kiali_multicluster). enabled: Terraform installs the MultiClusterObservability (charts/acm-observability) with Thanos in object storage on the hub, its namespace, a copy of the hub's pull secret and the thanos-object-storage Secret; the app-of-apps deploys charts/spoke-mesh-metrics on every mesh member. The object storage comes from terraform/rosa-hcp (cluster_provider = 'rosa'; apply it first with acm_observability_bucket = true) or from acm_observability_object_storage (kubeconfig). interval_sec: seconds between the metrics collectors' pushes to the hub (15 to 3600), also Kiali's scrape interval; 300 is ACM's default, 60 makes Kiali's view fresher and sends five times the samples. retention: how long Thanos keeps raw, 5m and 1h data, also Kiali's retention period (14d; Kiali's docs ask for at least 10d, for the downsampled data). storage_class: the hub StorageClass of the Thanos volumes (empty: the default one, gp3-csi on ROSA). istio_metrics_namespaces: the member namespaces whose Envoy metrics are scraped and sent, one Argo CD Application per member and namespace; Argo CD creates a namespace that does not exist yet. It must hold istio-system (istiod and the gateways) and never mesh-verify-gwapi-remote; add your own test namespaces here (each adds series on the members and the hub). enable_user_workload_monitoring: Argo CD creates openshift-monitoring/cluster-monitoring-config on each member with only enableUserWorkload: true; set false where a member has that ConfigMap already, and add enableUserWorkload: true to it yourself. Keep it off while a suite measures: the extra scraping loads the members."
+
+  validation {
+    condition     = !var.acm_observability.enabled || coalesce(var.platform, var.cluster_provider == "rosa" ? "openshift" : "kubernetes") == "openshift"
+    error_message = "acm_observability needs platform = \"openshift\": ACM Observability runs on an ACM hub and the member charts use OpenShift's user workload monitoring."
+  }
+
+  validation {
+    condition     = var.acm_observability.interval_sec == floor(var.acm_observability.interval_sec) && var.acm_observability.interval_sec >= 15 && var.acm_observability.interval_sec <= 3600
+    error_message = "acm_observability.interval_sec must be a whole number of seconds from 15 (ACM's minimum) to 3600."
+  }
+
+  validation {
+    condition     = can(regex("^[1-9][0-9]*[hdw]$", var.acm_observability.retention))
+    error_message = "acm_observability.retention must be a duration in hours, days or weeks, such as 14d, 336h or 2w."
+  }
+
+  validation {
+    condition     = var.acm_observability.storage_class == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.acm_observability.storage_class)) && length(var.acm_observability.storage_class) <= 253)
+    error_message = "acm_observability.storage_class must be empty (the default StorageClass) or a StorageClass name (a DNS-1123 subdomain)."
+  }
+
+  validation {
+    condition     = alltrue([for ns in var.acm_observability.istio_metrics_namespaces : can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", ns)) && length(ns) <= 63])
+    error_message = "acm_observability.istio_metrics_namespaces must be namespace names (DNS-1123 labels of at most 63 characters)."
+  }
+
+  validation {
+    condition     = length(distinct(var.acm_observability.istio_metrics_namespaces)) == length(var.acm_observability.istio_metrics_namespaces)
+    error_message = "acm_observability.istio_metrics_namespaces lists a namespace twice: each one is an Argo CD Application per member."
+  }
+
+  validation {
+    condition     = contains(var.acm_observability.istio_metrics_namespaces, "istio-system")
+    error_message = "acm_observability.istio_metrics_namespaces must hold istio-system: its Application scrapes istiod and the gateways and turns on user workload monitoring."
+  }
+
+  validation {
+    condition     = !contains(var.acm_observability.istio_metrics_namespaces, "mesh-verify-gwapi-remote")
+    error_message = "acm_observability.istio_metrics_namespaces must not hold mesh-verify-gwapi-remote: Argo CD would create it on every member, and the Gateway API check (misc_tests/gateway-api, S7-S9) needs a member without it."
+  }
+}
+
+variable "acm_observability_object_storage" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "kubeconfig mode with acm_observability: the Thanos object storage config (thanos.yaml) for the hub's Thanos, as in the ACM Observability docs. rosa mode ignores it and uses terraform/rosa-hcp's bucket. Stored in state; pass it with TF_VAR_acm_observability_object_storage."
+}
+
+variable "acm_observability_values" {
+  type        = any
+  default     = {}
+  description = "Extra values for charts/acm-observability, merged over Terraform's (for example mco.advanced with per-component resources, or mco.storageSizes before the first apply)."
+}
+
+variable "kiali_multicluster" {
+  type = object({
+    enabled   = optional(bool, false)
+    view_only = optional(bool, true)
+  })
+  default     = {}
+  nullable    = false
+  description = "platform openshift: one Kiali on the ACM hub for all mesh members (Red Hat's external deployment model), synced by the app-of-apps. enabled: the Kiali operator (OLM kiali-ossm) and a Kiali CR in istio-system on the hub and on every member; on the members the CR creates only Kiali's read-only ServiceAccount, its roles and the OAuthClient, and External Secrets copies that ServiceAccount's token to the hub as a remote cluster secret. Users log in with OpenShift accounts: on the hub, then once per member (terraform output kiali_url). The graph and metrics need acm_observability; without it they stay empty. view_only: the server's view_only_mode, so the UI makes no changes. Either way the members' ServiceAccount gets only the read-only kiali-viewer role (the openshift login). Needs enable_gitops and gitops_app_repo_url."
+
+  validation {
+    condition     = !var.kiali_multicluster.enabled || coalesce(var.platform, var.cluster_provider == "rosa" ? "openshift" : "kubernetes") == "openshift"
+    error_message = "kiali_multicluster needs platform = \"openshift\": the Kiali operator comes from OLM and logins go through OpenShift OAuth."
+  }
+
+  validation {
+    condition     = !var.kiali_multicluster.enabled || (var.enable_gitops && var.gitops_app_repo_url != "")
+    error_message = "kiali_multicluster needs enable_gitops = true and gitops_app_repo_url: Argo CD deploys Kiali through the app-of-apps."
+  }
+}
+
+# --------------------------------------------------------------------------
 # Incremental mesh deployment
 # --------------------------------------------------------------------------
 

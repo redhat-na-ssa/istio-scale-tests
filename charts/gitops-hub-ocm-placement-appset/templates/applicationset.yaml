@@ -1,5 +1,3 @@
-{{- $pn := .Values.placement.name | default "acm-openshift-gitops-placement" }}
-{{- $pdec := .Values.placement.placementDecisionName | default "" }}
 {{- $mode := required "destination.mode must be clusterName or inClusterServer" .Values.destination.mode }}
 {{- $gen := include "gitops-hub-ocm-placement-appset.generator" . }}
 {{- $cp := include "gitops-hub-ocm-placement-appset.clusterParam" . }}
@@ -9,6 +7,22 @@
 {{- $hubOn = or (eq $hubOn true) (eq ($hubOn | toString) "true") }}
 {{- if not (or $membersOn $hubOn) }}
 {{- fail "no generator: enable members (members.enabled) or inClusterGenerator.enabled" }}
+{{- end }}
+{{- $nsm := .Values.namespaceMatrix | default dict }}
+{{- $matrixOn := or (eq $nsm.enabled true) (eq ($nsm.enabled | toString) "true") }}
+{{- if $matrixOn }}
+{{- if $hubOn }}
+{{- fail "namespaceMatrix: members only, not with inClusterGenerator.enabled" }}
+{{- end }}
+{{- if not $membersOn }}
+{{- fail "namespaceMatrix needs the member generator (members.enabled)" }}
+{{- end }}
+{{- if ne $mode "clusterName" }}
+{{- fail "namespaceMatrix needs destination.mode clusterName (one Application per member and namespace), not inClusterServer" }}
+{{- end }}
+{{- if not $nsm.namespaces }}
+{{- fail "namespaceMatrix.namespaces is empty: list at least one namespace" }}
+{{- end }}
 {{- end }}
 {{- $src := .Values.template.source }}
 {{- $chartSrc := $src.chart | default "" }}
@@ -24,26 +38,17 @@ metadata:
 {{- include "gitops-hub-ocm-placement-appset.labels" . | nindent 4 }}
 spec:
   generators:
-{{- if and $membersOn (eq $gen "clusterDecisionResource") }}
-    - clusterDecisionResource:
-        configMapRef: {{ .Values.generatorConfigMap.name | quote }}
-{{- if $pdec }}
-        name: {{ $pdec | quote }}
-{{- else }}
-        labelSelector:
-{{- $selector := .Values.clusterDecisionResource.labelSelector | default dict }}
-{{- if $selector }}
-{{- toYaml $selector | nindent 10 }}
-{{- else }}
-          matchLabels:
-            cluster.open-cluster-management.io/placement: {{ $pn | quote }}
+{{- if $matrixOn }}
+    - matrix:
+        generators:
+{{- include "gitops-hub-ocm-placement-appset.memberGenerator" . | nindent 10 }}
+          - list:
+              elements:
+{{- range $nsm.namespaces }}
+                - targetNamespace: {{ . | quote }}
 {{- end }}
-{{- end }}
-        requeueAfterSeconds: {{ .Values.clusterDecisionResource.requeueAfterSeconds }}
 {{- else if $membersOn }}
-    - clusters:
-        selector:
-{{- toYaml (required "clusters.selector is required: an empty selector also selects the hub (in-cluster)" .Values.clusters.selector) | nindent 10 }}
+{{- include "gitops-hub-ocm-placement-appset.memberGenerator" . | nindent 4 }}
 {{- end }}
 {{- if $hubOn }}
     - list:
@@ -81,9 +86,9 @@ spec:
 {{- end }}
 {{- $helm := $src.helm | default dict }}
 {{- $vf := ternary list (.Values.memberValueFiles | default list) (not (empty $chartSrc)) }}
-{{- if or (and (eq $mode "clusterName") $helm.releaseName) (eq $mode "inClusterServer") ($helm.parameters) ($helm.valuesObject) $vf }}
+{{- if or $helm.releaseName (eq $mode "inClusterServer") ($helm.parameters) ($helm.valuesObject) $vf }}
         helm:
-{{- if and (eq $mode "clusterName") $helm.releaseName }}
+{{- if $helm.releaseName }}
           releaseName: {{ $helm.releaseName | quote }}
 {{- end }}
 {{- with $vf }}

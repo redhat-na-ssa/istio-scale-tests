@@ -213,6 +213,180 @@ forking:
 The child apps sync from `gitops_app_repo_url` at `gitops_app_repo_revision`, so a fork or branch
 deploys from itself. Edited charts roll out on the next apply.
 
+## OpenShift add-ons: ACM Observability and Kiali
+
+Two toggles, both off by default and both for `platform = "openshift"` only (the plan refuses
+them on `kubernetes`, and with them off nothing changes on the clusters or in the app-of-apps
+values).
+Together they give one Kiali on the ACM hub that shows every mesh member: namespaces, workloads,
+services, Istio config validation, and a traffic graph and metrics for the namespaces you list.
+
+| Toggle | Installs | Where | By |
+| --- | --- | --- | --- |
+| `acm_observability` | The `MultiClusterObservability` (`observability`), ACM's custom metrics allowlist, the namespace `open-cluster-management-observability`, a copy of the hub's pull secret and the Secret `thanos-object-storage` ([charts/acm-observability](../../charts/acm-observability/README.md)). ACM then runs Thanos, Grafana and the Observatorium API on the hub and a metrics collector on every managed cluster, the hub included | hub | Terraform |
+| `acm_observability` | Per mesh member and per namespace in `istio_metrics_namespaces`: an Envoy PodMonitor and an allowlist; in `istio-system` also the istiod ServiceMonitor and `openshift-monitoring/cluster-monitoring-config` (user workload monitoring) ([charts/spoke-mesh-metrics](../../charts/spoke-mesh-metrics/README.md)). Applications `<member>-mesh-metrics-<namespace>` | members | Argo CD (`spoke-mesh-metrics-appset`, wave 30) |
+| `kiali_multicluster` | The Kiali operator (OLM `kiali-ossm`, namespace `kiali-operator`) and a Kiali CR in `istio-system` that creates only Kiali's read-only ServiceAccount, its roles and the OAuthClient, plus that ServiceAccount's token Secret ([charts/kiali](../../charts/kiali/README.md)). Applications `<member>-kiali` | members | Argo CD (`spoke-kiali-appset`, wave 31) |
+| `kiali_multicluster` | The Kiali operator and the Kiali server in `istio-system` (external deployment model: it reads the members remotely and ignores the hub's own cluster) | hub | Argo CD (`hub-kiali`, wave 32) |
+| `kiali_multicluster` | One remote cluster secret per member, `istio-system/kiali-remote-cluster-secret-<member>`, which External Secrets builds from the member's token ([charts/hub-kiali-remote-secret](../../charts/hub-kiali-remote-secret/README.md)) | hub | Argo CD (`hub-kiali-remote-secret-appset`, wave 33) |
+| `kiali_multicluster` | The Kiali CR's health check in the ArgoCD CR (`charts/argocd-config`) | hub | Terraform |
+
+Kiali needs the app-of-apps (`enable_gitops`, `gitops_app_repo_url`). It works without
+`acm_observability`, but then its graph and metrics stay empty, and the plan warns.
+
+Upgrading an existing platform state to the commit that added the add-ons, with both off, still
+plans two in-place updates, `helm_release.argocd_config` and `helm_release.mesh_wiring_verify_appset`:
+their charts gained the add-ons' options, so their `chartChecksum` changed. They render the same
+manifests, so the two helm upgrades change nothing on the hub.
+
+### Before you turn them on
+
+- Object storage for Thanos. `cluster_provider = "rosa"`: apply `terraform/rosa-hcp` with
+  `acm_observability_bucket = true` first; it creates an S3 bucket and an IAM role that the Thanos
+  ServiceAccounts assume through the hub's OIDC provider (STS), and this root reads both from its
+  state (`terraform/rosa-hcp/README.md`). `cluster_provider = "kubeconfig"`: pass the whole
+  `thanos.yaml`, in the format of the ACM Observability docs, in `acm_observability_object_storage`
+  (`export TF_VAR_acm_observability_object_storage="$(cat thanos.yaml)"`). Without either the plan
+  stops at the `thanos-object-storage` Secret and says which.
+- Every member reaches the hub's `observatorium-api` Route (`*.<hub apps domain>`): the collectors
+  push there directly (the ACM docs support no proxy in between).
+- Hub capacity: the add-ons request about 2.9 CPU and 12.6 GiB more on the hub (ACM's default
+  Observability size 2.7 CPU / 11.7 GiB, the hub's own collectors, the Kiali server 100m / 256Mi
+  and its operator). Each member gets the user workload monitoring stack (two Prometheus
+  replicas), the collectors (about 22m / 250Mi) and one Kiali operator pod, no Kiali server.
+
+```hcl
+acm_observability = {
+  enabled = true
+  # Add your own test namespaces; istio-system stays.
+  istio_metrics_namespaces = ["istio-system", "mesh-verify", "mesh-verify-gwapi", "mesh-verify-gwapi-shared", "<my-test-ns>"]
+}
+kiali_multicluster = { enabled = true }
+```
+
+### Values
+
+- `acm_observability.interval_sec` (60): seconds between the collectors' pushes to the hub,
+  15 to 3600. It is also Kiali's `thanos_proxy.scrape_interval`, which must match or Kiali's
+  charts stay empty, so set it only here. ACM's default is 300; 60 makes Kiali's view fresher and
+  sends five times as many samples into the hub.
+- `acm_observability.retention` (`14d`): how long Thanos keeps raw, 5m and 1h data, and Kiali's
+  `thanos_proxy.retention_period`. Kiali's docs ask for at least 10 days, for the downsampled data.
+- `acm_observability.storage_class` (empty: the default StorageClass, `gp3-csi` on ROSA). The
+  Thanos volume sizes (about 116 GiB in all) take effect at the first apply only: change them with
+  `mco.storageSizes` in `acm_observability_values` before it.
+- `acm_observability.istio_metrics_namespaces`: the member namespaces whose Envoy metrics are
+  scraped and sent; default `istio-system` (istiod and the gateways) and the three mesh-verify
+  namespaces. One Argo CD Application per member and namespace, and Argo CD creates a namespace
+  that does not exist yet, so an on-demand namespace such as `mesh-verify` can be listed before its
+  check runs. It must hold `istio-system`, no namespace twice, and never
+  `mesh-verify-gwapi-remote`: Argo CD would create that on every member, and the Gateway API
+  check needs a member without it. The scale suites' namespaces are not in it: add a test namespace
+  of your own here, knowing that each one adds series on the members and the hub (ACM's default
+  size is rated for fewer than 200k active series).
+- `acm_observability.enable_user_workload_monitoring` (true): Argo CD creates
+  `openshift-monitoring/cluster-monitoring-config` on each member with only
+  `enableUserWorkload: true`. Set false where a member has that ConfigMap already, and add the line
+  to it yourself.
+- `acm_observability_values`: extra values for `charts/acm-observability`, merged over
+  Terraform's, for example `mco.advanced` with per-component resources.
+- `kiali_multicluster.view_only` (true): Kiali's UI shows the mesh but makes no changes (the
+  server's `view_only_mode`). The members' ServiceAccount has only the read-only `kiali-viewer`
+  role either way; with `false`, a change made in the UI goes through with the logged-in user's own
+  OpenShift permissions on that cluster.
+- The hub's ACM cluster (`acm_local_cluster_name`) stays enrolled in Observability, which gives
+  ACM's Grafana the hub's own load during a run.
+
+### What an apply does
+
+1. Terraform adds the Kiali health check to the ArgoCD CR and the add-ons' child apps to the
+   app-of-apps, and creates the observability namespace and its two Secrets (after the
+   MultiClusterHub).
+2. Argo CD syncs the child apps in wave order. On each member user workload monitoring comes up
+   and the monitors and allowlists appear in each listed namespace; the Kiali operator installs,
+   its CR creates the ServiceAccount, and the token Secret follows once the CR is healthy. On the
+   hub the Kiali server starts, External Secrets copies each member's token into a remote cluster
+   secret, and `hub-kiali`'s PostSync hook waits for all of them (30 minutes at most) and annotates
+   the Kiali CR so the operator mounts them.
+3. The apply's Argo CD status check runs, then Terraform installs the MultiClusterObservability:
+   ACM's user workload collector on a member starts only once that member's user-workload
+   Prometheus exists. ACM then takes a few minutes to start Thanos on the hub and the collectors
+   on every cluster.
+
+### Check it
+
+```bash
+oc --context <hub-ctx> get multiclusterobservability observability -o jsonpath='{.status.conditions}'   # Ready
+oc --context <hub-ctx> -n open-cluster-management-observability get pods
+oc --context <hub-ctx> get managedclusteraddons -A | grep observability   # Available on every cluster
+oc --context <hub-ctx> -n openshift-gitops get applications.argoproj.io | grep -e mesh-metrics -e kiali
+oc --context <mesh-a-ctx> -n openshift-user-workload-monitoring get pods
+oc --context <hub-ctx> -n istio-system get kialis.kiali.io kiali -o jsonpath='{.status.conditions}'   # Successful
+oc --context <hub-ctx> -n istio-system get secrets -l kiali.io/multiCluster=true   # one per member
+# The members' Istio metrics in Thanos: one row per member.
+oc --context <hub-ctx> -n open-cluster-management-observability port-forward svc/observability-thanos-query-frontend 9090 &
+curl -s http://localhost:9090/api/v1/query --data-urlencode 'query=count by (cluster) (istio_build)'
+```
+
+On ROSA in STS mode, the Thanos pods carry the role (`AWS_ROLE_ARN` in
+`oc --context <hub-ctx> -n open-cluster-management-observability get pod observability-thanos-compact-0 -o yaml`)
+and the bucket fills with blocks about two hours after the start. If the compact log shows S3
+`AccessDenied`, switch to a static key ([charts/acm-observability](../../charts/acm-observability/README.md#object-storage-sts-or-static-keys)).
+
+### Log in
+
+`terraform output kiali_url` gives the hub's Kiali route (null while `kiali_multicluster` is
+off). Log in there with an OpenShift account of the hub, then once per member through
+"Login to <member>" in the profile menu: four logins with three members. OpenShift OAuth has no
+single sign-on across clusters; Kiali's single login needs Kiali 2.30 or later, and OSSM 3.4 ships
+2.27. The route's host comes from the hub's ingress config at plan time and is kept only in the
+state and the root Application.
+
+### Turn them off
+
+Set `enabled = false` and apply. Turning `kiali_multicluster` off first updates the app-of-apps,
+which then stops rendering the three Kiali child apps; the root syncs with prune off, so the apply
+next deletes them itself (`kiali_app_cleanup`) and waits until they are gone. Their PreDelete hooks
+delete each Kiali CR (the operator removes its OAuthClient, roles and ServiceAccount) and then the
+operator; a last step (`kiali_cr_cleanup`) deletes any Kiali CR, Subscription or CSV left on each
+cluster, and the Kiali health check leaves the ArgoCD CR. Left behind: the hub's `istio-system`
+namespace and the CRD `kialis.kiali.io`.
+
+The cleanup resources are `create_before_destroy`: that is what puts the app-of-apps update first.
+Without it Terraform would destroy them first (an updated resource waits for the destroy of what it
+depends on), the root's self-heal would recreate the apps the cleanup deletes, and they would stay
+behind, deployed, once the update lands. After the apply, this should list nothing for the add-on
+you turned off:
+
+```bash
+oc --context <hub-ctx> -n openshift-gitops get applications.argoproj.io,applicationsets.argoproj.io | grep -e kiali -e mesh-metrics
+```
+
+Turning `acm_observability` off works the same way for the member metrics Applications (the
+monitors, the allowlists and `cluster-monitoring-config`, which stops user workload monitoring;
+`mesh_metrics_member_cleanup` deletes what is left of them on each member), and it uninstalls the
+MultiClusterObservability. The apply then waits, up to 15 minutes, until ACM has removed the MCO
+and every cluster's ObservabilityAddon, and only then deletes the Secrets and the namespace (the
+Thanos volumes go with it). If the wait fails it names what is left, with the commands to inspect
+it, and the apply stops before the namespace goes. Left behind: the namespaces Argo CD created for
+listed namespaces that did not exist (delete them by hand when nothing else uses them) and the
+bucket's data, until `terraform/rosa-hcp` drops the bucket.
+
+### Caveats
+
+- Kiali's graph has gaps under the mesh's tuning baseline (client-side request metrics off), for
+  example edges to unselected namespaces and egress destinations:
+  [charts/kiali/README.md](../../charts/kiali/README.md).
+- Observer effect: the user workload Prometheus and the collectors add load on the members. Keep
+  the add-on off while a suite measures; the suites' platform record does not show it yet.
+- Kiali version drift: `kiali-ossm` has no channel per minor version. `startingCSV` pins the first
+  install only, and with automatic approval OLM moves to a newer Kiali when its `stable` channel
+  gets one, which may then be ahead of OSSM's (BACKLOG.md, section 10: Manual approval).
+- The hub's pull secret and `thanos.yaml` (with a static key, the key too) are in this root's
+  state.
+- The hub's in-cluster Thanos query-frontend (port 9090), which Kiali queries, has no
+  authentication and serves every cluster's metrics to anything that can reach the service. The
+  mutual-TLS Observatorium path is a follow-up (BACKLOG.md, section 10).
+
 ## Rotating a member's token
 
 On `kubernetes` the token in a member's Argo CD cluster Secret comes from the Secret
@@ -269,6 +443,16 @@ istiod pods. On `openshift` the ACM ManagedServiceAccount issues and rotates the
 cluster-admin token is left behind, and the `spoke_service_account_namespace` namespace when the
 apply created it (never `kube-system` or a namespace without its label). For ROSA, then follow
 `terraform/rosa-hcp/README.md`.
+
+With the OpenShift add-ons on, destroy first deletes the Kiali and member metrics Applications
+with the rest (their PreDelete hooks remove the Kiali CRs and operators; the cascade then waits up
+to 20 minutes instead of 10), then deletes any Kiali CR, Subscription or CSV and anything labelled
+by `charts/spoke-mesh-metrics` left on each cluster. In parallel it uninstalls the MultiClusterObservability
+and waits, up to 15 minutes, until ACM has removed it and every cluster's ObservabilityAddon,
+before the observability namespace, the MultiClusterHub and the spokes go; when the wait fails the
+destroy stops there and names what is left. The `terraform/rosa-hcp` destroy then deletes the
+bucket with its data, the IAM role and policy (and the static key's user), and its teardown audit
+checks for them by name.
 
 On an existing OpenShift hub (`acm_install_operator = false`) destroy keeps the MultiClusterHub and
 the KlusterletConfig, but still deletes:

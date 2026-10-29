@@ -1,0 +1,14 @@
+{{- $mode := include "kiali.mode" . }}
+# The Kiali operator's namespace. The Kiali CR's namespace (kialiNamespace) is created by Argo CD
+# on the hub (CreateNamespace) and exists already on a mesh member.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.operatorNamespace | quote }}
+  {{- if .Values.argoSyncWaves.enabled }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.argoSyncWaves.namespace | quote }}
+  {{- end }}
+  labels:
+    {{- include "kiali.labels" . | nindent 4 }}
+    openshift.io/cluster-monitoring: "true"

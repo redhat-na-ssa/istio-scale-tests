@@ -1,0 +1,44 @@
+{{- if and .Values.clusterName .Values.clusterServer .Values.rbac.enabled }}
+{{- /* Named from clusterName: every member's release shares one release name on the hub. */}}
+{{- $name := printf "kiali-%s-argocd-sync" .Values.clusterName | trunc 63 | trimSuffix "-" }}
+{{- range $ns := list .Values.esoNamespace .Values.kialiNamespace }}
+---
+# Lets the Argo CD application controller manage the ESO CRs, Secrets, ServiceAccounts and
+# Roles of this chart in {{ $ns }}.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name | quote }}
+  namespace: {{ $ns | quote }}
+  {{- with include "hub-kiali-remote-secret.waveAnnotations" (dict "root" $ "wave" "rbac") }}{{ . | nindent 2 }}{{- end }}
+  labels:
+    {{- include "hub-kiali-remote-secret.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: ["external-secrets.io"]
+    resources: ["externalsecrets", "secretstores"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name | quote }}
+  namespace: {{ $ns | quote }}
+  {{- with include "hub-kiali-remote-secret.waveAnnotations" (dict "root" $ "wave" "rbac") }}{{ . | nindent 2 }}{{- end }}
+  labels:
+    {{- include "hub-kiali-remote-secret.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name | quote }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $.Values.rbac.argocd.serviceAccountName | quote }}
+    namespace: {{ $.Values.rbac.argocd.namespace | quote }}
+{{- end }}
+{{- end }}

@@ -330,6 +330,14 @@ resource "helm_release" "argocd_config" {
       name  = "argocd.applicationSet.sourceNamespaces[${i}]"
       value = ns
     }],
+    # The Kiali CR's health check, so a member's token Secret syncs only once the Kiali
+    # operator has created its ServiceAccount (kiali_multicluster; nothing changes when off).
+    local.kiali_enabled ? [
+      {
+        name  = "argocd.kialiHealthCheck.enabled"
+        value = "true"
+      },
+    ] : [],
   )
 
   depends_on = [time_sleep.wait_argocd_stabilized]
@@ -534,19 +542,33 @@ resource "helm_release" "gitops_hub_app_of_apps" {
 
   # Provider defaults come as their own values document BEFORE the user overrides, so
   # Helm deep-merges an override of the same app into them (Terraform's merge() is
-  # shallow, and a later -var-file replaces the whole gitops_app_overrides map).
-  values = [yamlencode({
-    platform        = local.platform
-    gitopsNamespace = local.gitops_namespace
-    repo = {
-      url      = var.gitops_app_repo_url
-      revision = var.gitops_app_repo_revision
-    }
-    }), yamlencode({ apps = local.provider_app_defaults }),
-    yamlencode({ apps = var.gitops_app_overrides }),
-  yamlencode({ chartChecksum = local.chart_checksum["gitops-hub-app-of-apps"] })]
+  # shallow, and a later -var-file replaces the whole gitops_app_overrides map). The OpenShift
+  # add-ons' apps (acm_observability, kiali_multicluster) follow as one more document, also
+  # before the overrides, and only when one is on: with both off the values are unchanged.
+  values = concat(
+    [yamlencode({
+      platform        = local.platform
+      gitopsNamespace = local.gitops_namespace
+      repo = {
+        url      = var.gitops_app_repo_url
+        revision = var.gitops_app_repo_revision
+      }
+    }), yamlencode({ apps = local.provider_app_defaults })],
+    length(local.addon_app_defaults) > 0 ? [yamlencode({ apps = local.addon_app_defaults })] : [],
+    [yamlencode({ apps = var.gitops_app_overrides }),
+    yamlencode({ chartChecksum = local.chart_checksum["gitops-hub-app-of-apps"] })],
+  )
 
-  depends_on = [helm_release.acm_gitops_resources, helm_release.argocd, kubernetes_manifest.gitops_repo_credentials]
+  # The add-ons' cleanup resources: on destroy they run after this release is gone. When an add-on
+  # is turned off they run after this release's update stops rendering their apps, because they
+  # are create_before_destroy (without it Terraform would destroy them before this update).
+  depends_on = [
+    helm_release.acm_gitops_resources,
+    helm_release.argocd,
+    kubernetes_manifest.gitops_repo_credentials,
+    terraform_data.kiali_app_cleanup,
+    terraform_data.mesh_metrics_app_cleanup,
+  ]
 }
 
 # --- Mesh-wiring health gate ApplicationSet ---
@@ -909,14 +931,16 @@ resource "terraform_data" "spoke_ossm_csv_cleanup" {
 resource "terraform_data" "argocd_app_cleanup" {
   count = local.gitops_enabled && var.gitops_app_repo_url != "" ? 1 : 0
 
-  input = {
+  # With kiali_multicluster on, the cascade waits longer: each Kiali PreDelete hook may wait up to
+  # 300 s for its CR (only then is the key in the input, so a plan with the add-on off is unchanged).
+  input = merge({
     token_script     = local.token_script
     hub_api_url      = local.hub_api_url
     hub_admin_pass   = local.hub_admin_pass
     kubeconfig_path  = local.kubeconfig
     hub_context      = local.hub_cluster_key
     gitops_namespace = local.gitops_namespace
-  }
+  }, local.kiali_enabled ? { timeout_sec = "1200" } : {})
 
   # Destroyed before these: the member apps are deleted while Argo CD can still reach the
   # spokes through their cluster Secrets.
@@ -924,6 +948,8 @@ resource "terraform_data" "argocd_app_cleanup" {
     helm_release.gitops_hub_app_of_apps,
     terraform_data.spoke_ossm_csv_cleanup,
     terraform_data.spoke_access_cleanup,
+    terraform_data.kiali_cr_cleanup,
+    terraform_data.mesh_metrics_member_cleanup,
   ]
 
   provisioner "local-exec" {
@@ -936,6 +962,7 @@ resource "terraform_data" "argocd_app_cleanup" {
       KUBECONFIG_PATH = self.input.kubeconfig_path
       KUBE_CONTEXT    = self.input.hub_context
       GITOPS_NS       = self.input.gitops_namespace
+      TIMEOUT_SEC     = try(self.input.timeout_sec, "600")
     }
   }
 }

@@ -1,0 +1,5 @@
+apiVersion: v2
+name: spoke-mesh-metrics
+description: "OpenShift add-on: user workload monitoring, the istiod ServiceMonitor, an Envoy PodMonitor and the ACM metrics allowlist for one namespace of a mesh member."
+type: application
+version: 0.1.0

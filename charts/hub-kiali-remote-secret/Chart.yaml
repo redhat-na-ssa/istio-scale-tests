@@ -1,0 +1,5 @@
+apiVersion: v2
+name: hub-kiali-remote-secret
+description: "OpenShift add-on: on the hub, the Kiali remote cluster secret of one mesh member, built by External Secrets from the member's kiali-service-account token."
+type: application
+version: 0.1.0

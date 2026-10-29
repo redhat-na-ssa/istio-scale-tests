@@ -1,0 +1,37 @@
+{{- if and (include "gitops-hub-apps.enabled" (dict "root" $ "name" "hub-kiali")) (eq (include "gitops-hub-apps.platform" .) "openshift") }}
+# OpenShift add-on (kiali_multicluster): the Kiali operator and the Kiali server on the hub, in
+# the external deployment model (charts/kiali, mode hub). Argo CD creates istio-system.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hub-kiali
+  namespace: {{ .Values.gitopsNamespace | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  annotations:
+    argocd.argoproj.io/sync-wave: "32"
+  labels:
+    app.kubernetes.io/name: gitops-hub-apps
+    app.kubernetes.io/component: hub-kiali
+spec:
+  project: default
+  source:
+    repoURL: {{ include "gitops-hub-apps.repoURL" . }}
+    targetRevision: {{ include "gitops-hub-apps.revision" . }}
+    path: charts/kiali
+    helm:
+      releaseName: kiali
+      valueFiles:
+        - values-openshift.yaml
+      parameters:
+        - name: mode
+          value: hub
+      {{- with include "gitops-hub-apps.valuesObject" (dict "root" $ "name" "hub-kiali") }}{{ . | nindent 6 }}{{- end }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: istio-system
+  syncPolicy:
+    {{- include "gitops-hub-apps.syncPolicy" . | nindent 4 }}
+    syncOptions:
+      - CreateNamespace=true
+{{- end }}

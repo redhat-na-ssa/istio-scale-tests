@@ -1,0 +1,44 @@
+{{- $mco := .Values.mco }}
+{{- if lt (int $mco.interval) 15 }}
+{{- fail (printf "mco.interval must be at least 15 seconds (ACM's minimum), not %v" $mco.interval) }}
+{{- end }}
+{{- $retention := dict "retentionResolutionRaw" $mco.retention "retentionResolution5m" $mco.retention "retentionResolution1h" $mco.retention }}
+{{- $advanced := dict "retentionConfig" $retention }}
+{{- if $mco.roleArn }}
+{{- /* ACM 2.17 STS: each Thanos component's ServiceAccount names the role. */}}
+{{- range $c := list "compact" "store" "rule" "receive" "query" }}
+{{- $_ := set $advanced $c (dict "serviceAccountAnnotations" (dict "eks.amazonaws.com/role-arn" $mco.roleArn)) }}
+{{- end }}
+{{- end }}
+{{- $advanced = mustMergeOverwrite $advanced (deepCopy ($mco.advanced | default dict)) }}
+apiVersion: observability.open-cluster-management.io/v1beta2
+kind: MultiClusterObservability
+metadata:
+  name: {{ $mco.name }}
+  annotations:
+    # Keeps ACM's endpoint operator out of every cluster's
+    # openshift-monitoring/cluster-monitoring-config: Argo CD owns it on the members
+    # (charts/spoke-mesh-metrics), HyperShift on a ROSA HCP hub.
+    mco-disable-alerting: "true"
+  labels:
+    app.kubernetes.io/name: acm-observability
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  imagePullSecret: {{ $mco.imagePullSecret }}
+  observabilityAddonSpec:
+    enableMetrics: true
+    interval: {{ int $mco.interval }}
+  storageConfig:
+    metricObjectStorage:
+      name: {{ $mco.objectStorageSecret.name }}
+      key: {{ $mco.objectStorageSecret.key }}
+{{- with $mco.storageClass }}
+    storageClass: {{ . }}
+{{- end }}
+    alertmanagerStorageSize: {{ $mco.storageSizes.alertmanager }}
+    compactStorageSize: {{ $mco.storageSizes.compact }}
+    receiveStorageSize: {{ $mco.storageSizes.receive }}
+    ruleStorageSize: {{ $mco.storageSizes.rule }}
+    storeStorageSize: {{ $mco.storageSizes.store }}
+  advanced:
+    {{- toYaml $advanced | nindent 4 }}

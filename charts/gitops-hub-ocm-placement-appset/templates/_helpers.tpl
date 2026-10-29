@@ -19,6 +19,37 @@ The member generator: clusters (Argo CD cluster Secrets) or clusterDecisionResou
 {{- end }}
 
 {{/*
+The member generator at indent 0, which applicationset.yaml indents (alone, or in a matrix with
+namespaceMatrix): clusterDecisionResource on the ACM PlacementDecisions of placement.name, or
+clusters on the Argo CD cluster Secrets that match clusters.selector.
+*/}}
+{{- define "gitops-hub-ocm-placement-appset.memberGenerator" -}}
+{{- $pn := .Values.placement.name | default "acm-openshift-gitops-placement" -}}
+{{- $pdec := .Values.placement.placementDecisionName | default "" -}}
+{{- if eq (include "gitops-hub-ocm-placement-appset.generator" .) "clusterDecisionResource" -}}
+- clusterDecisionResource:
+    configMapRef: {{ .Values.generatorConfigMap.name | quote }}
+{{- if $pdec }}
+    name: {{ $pdec | quote }}
+{{- else }}
+    labelSelector:
+{{- $selector := .Values.clusterDecisionResource.labelSelector | default dict }}
+{{- if $selector }}
+{{- toYaml $selector | nindent 6 }}
+{{- else }}
+      matchLabels:
+        cluster.open-cluster-management.io/placement: {{ $pn | quote }}
+{{- end }}
+{{- end }}
+    requeueAfterSeconds: {{ .Values.clusterDecisionResource.requeueAfterSeconds }}
+{{- else -}}
+- clusters:
+    selector:
+{{- toYaml (required "clusters.selector is required: an empty selector also selects the hub (in-cluster)" .Values.clusters.selector) | nindent 6 }}
+{{- end -}}
+{{- end }}
+
+{{/*
 The generator parameter that holds a member's Argo CD cluster name: {{clusterName}} from a
 PlacementDecision, {{name}} from a cluster Secret. Presets write {{clusterName}}.
 */}}

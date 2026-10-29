@@ -1,0 +1,90 @@
+# hub: the Kiali server (external deployment model) and its operator on the ACM hub.
+# remote: on a mesh member, the operator and a Kiali CR that creates only what the hub's Kiali
+# needs there (remote_cluster_resources_only), plus the ServiceAccount's token Secret.
+mode: hub
+
+# hub: kubernetes_config.cluster_name (Terraform: the ACM local cluster name). remote: the
+# member's cluster name (ApplicationSet: {{clusterName}}); the hub callback URI ends with it.
+clusterName: ""
+
+# remote: https://kiali-istio-system.<hub apps domain>/api/auth/callback (Terraform).
+hubRedirectBase: ""
+
+# hub: the members whose remote secrets the PostSync hook waits for (Terraform).
+remoteClusters: []
+
+# deployment.view_only_mode of every CR: the UI makes no changes. With the openshift login the
+# operator gives a member's kiali-service-account the read-only kiali-viewer role either way.
+viewOnly: true
+
+# The Kiali CR's namespace on every cluster: the OAuthClient kiali-istio-system takes its name.
+kialiNamespace: istio-system
+
+# The Kiali operator's own namespace (AllNamespaces OperatorGroup).
+operatorNamespace: kiali-operator
+
+operatorGroup:
+  name: kiali-operator
+
+subscription:
+  name: kiali-ossm
+  package: kiali-ossm
+  channel: stable
+  # Version pin (CONTRIBUTING.md): the Kiali that OSSM 3.4 ships; keep in sync with the OSSM
+  # channel (charts/spoke-ossm-operator). kiali-ossm has no per-minor channel, so with Automatic
+  # approval OLM moves to a newer CSV when stable gets one.
+  startingCSV: kiali-operator.v2.27.5
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+
+# hub only: the Kiali server.
+server:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 2Gi
+  # Same selectors as istiod's (charts/spoke-ossm tuningBaseline.discoverySelectors).
+  discoverySelectors:
+    - matchLabels:
+        istio-discovery: "enabled"
+    - matchLabels:
+        kubernetes.io/metadata.name: istio-system
+
+# hub only: ACM Observability's Thanos query-frontend (charts/acm-observability).
+prometheus:
+  url: http://observability-thanos-query-frontend.open-cluster-management-observability.svc:9090
+  # Must equal the MCO's observabilityAddonSpec.interval, or Kiali's charts stay empty
+  # (terraform/platform sets both from acm_observability.interval_sec).
+  scrapeInterval: 60s
+  # The MCO's retention (acm_observability.retention).
+  retentionPeriod: 14d
+
+# hub only: how long the PostSync hook waits for the remote secrets before it fails the sync.
+reconcileHook:
+  timeoutSeconds: 1800
+
+# oc image for the PostSync and PreDelete hook Jobs. Match the tag to the cluster's OpenShift minor.
+image:
+  repository: registry.redhat.io/openshift4/ose-cli-rhel9
+  tag: v4.21
+
+# hub only: Roles for what the OpenShift GitOps application controller may not do by default
+# (hook Jobs and their RBAC, the Kiali CR).
+rbac:
+  enabled: true
+  argocd:
+    namespace: openshift-gitops
+    serviceAccountName: openshift-gitops-argocd-application-controller
+
+argoSyncWaves:
+  enabled: true
+  namespace: "-30"
+  rbac: "-20"
+  operator: "-10"
+  kiali: "0"
+  # After the Kiali CR is healthy (argocd-config kialiHealthCheck), so the operator has created
+  # the ServiceAccount; a token Secret without it is deleted by Kubernetes.
+  token: "5"

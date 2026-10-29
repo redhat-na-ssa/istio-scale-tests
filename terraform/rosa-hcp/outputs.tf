@@ -39,6 +39,26 @@ output "by_cluster" {
   }
 }
 
+output "acm_observability_storage" {
+  description = "acm_observability_bucket: the Thanos bucket for terraform/platform (null when off). auth: sts (role_arn) or static (acm_observability_storage_credentials)."
+  value = var.acm_observability_bucket ? {
+    bucket   = aws_s3_bucket.acm_observability[0].bucket
+    region   = var.aws_region
+    endpoint = "s3.${var.aws_region}.amazonaws.com"
+    role_arn = aws_iam_role.acm_observability[0].arn
+    auth     = var.acm_observability_bucket_static_key ? "static" : "sts"
+  } : null
+}
+
+output "acm_observability_storage_credentials" {
+  description = "acm_observability_bucket_static_key: the bucket user's access key (null otherwise)."
+  sensitive   = true
+  value = var.acm_observability_bucket && var.acm_observability_bucket_static_key ? {
+    access_key_id     = aws_iam_access_key.acm_observability[0].id
+    secret_access_key = aws_iam_access_key.acm_observability[0].secret
+  } : null
+}
+
 output "service_quota_targets" {
   description = "Computed minimum quota levels (before max with current AWS limits). For debugging; see service_quotas.tf."
   value = {

@@ -1,0 +1,5 @@
+apiVersion: v2
+name: acm-observability
+description: "OpenShift add-on: ACM Observability's MultiClusterObservability and the hub's custom metrics allowlist."
+type: application
+version: 0.1.0

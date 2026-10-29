@@ -1,0 +1,5 @@
+apiVersion: v2
+name: kiali
+description: "OpenShift add-on: the Kiali operator (OLM) and a Kiali CR, the server on the ACM hub (external deployment model) or the resources it needs on a mesh member."
+type: application
+version: 0.1.0

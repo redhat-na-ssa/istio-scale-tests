@@ -1,0 +1,46 @@
+# Preset, OpenShift add-on (terraform/platform kiali_multicluster): on every mesh member, the
+# Kiali operator (OLM) and a Kiali CR that creates only what the hub's Kiali needs there, plus
+# the token Secret of its ServiceAccount (charts/kiali, mode remote).
+identity:
+  component: spoke-kiali
+
+placementRbac:
+  roleName: openshift-gitops-ocm-placement-spoke-kiali
+  roleBindingName: openshift-gitops-ocm-placement-spoke-kiali
+
+argocdApplicationControllerRbac:
+  roleName: gitops-spoke-kiali-appset-argocd-sync
+  roleBindingName: gitops-spoke-kiali-appset-argocd-sync
+
+applicationSet:
+  name: spoke-kiali
+
+destination:
+  mode: clusterName
+  namespace: istio-system
+
+template:
+  applicationNameSuffix: kiali
+  # Kubernetes fills in the ServiceAccount token Secret's data.
+  ignoreDifferences:
+    - group: ""
+      kind: Secret
+      name: kiali-service-account
+      namespace: istio-system
+      jsonPointers:
+        - /data
+  source:
+    path: charts/kiali
+    helm:
+      releaseName: kiali
+      parameters:
+        - name: mode
+          value: remote
+        - name: clusterName
+          value: "{{clusterName}}"
+      # terraform/platform sets hubRedirectBase (the hub Kiali's callback URL without the
+      # member's name) and viewOnly. Left empty, every member's render fails with a message
+      # instead of deploying a Kiali CR the operator refuses.
+      valuesObject:
+        hubRedirectBase: ""
+        viewOnly: true

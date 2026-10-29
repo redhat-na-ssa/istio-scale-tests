@@ -65,6 +65,8 @@ flowchart TB
 | `cert-manager` | cert-manager, the mesh's root CA and one intermediate CA per member | Every member's istiod signs with its own intermediate of one shared root, so the members trust each other |
 | `external-secrets-operator` | External Secrets | Copies each member's CA (`cacerts`) to it, and gives every member the credentials (remote secrets) to read the other members' Services |
 | `open-cluster-management` (OpenShift only) | ACM | Picks the member clusters on OpenShift |
+| `open-cluster-management-observability` (OpenShift add-on `acm_observability`, off by default) | ACM Observability: Thanos, which keeps every cluster's metrics in object storage (S3 on ROSA) | Collects the members' Istio metrics for Kiali |
+| `istio-system` and `kiali-operator` (OpenShift add-on `kiali_multicluster`, off by default) | Kiali and the Kiali operator | One Kiali for every member: their workloads, Istio config and traffic graph |
 
 **On each mesh member** (installed by Argo CD; you never apply these by hand):
 
@@ -74,11 +76,19 @@ flowchart TB
 | `istio-system` | istiod (3 replicas), the ingress gateway, the east-west gateway | The member's control plane; the ingress for test traffic; the cross-cluster entry point (a `LoadBalancer` Service on port 15443) |
 | `istio-cni` | The Istio CNI node agent | Sets up each pod's traffic redirection |
 | `mesh-wiring-verify` | One small pod, the wiring gate | Ready only when this member can see every other member ([Check the mesh](#2-check-the-mesh)) |
+| `kiali-operator` (OpenShift add-on `kiali_multicluster`) | The Kiali operator | Creates the read-only account and the login client the hub's Kiali uses on this member |
+| `openshift-user-workload-monitoring` (OpenShift add-on `acm_observability`) | OpenShift's user workload Prometheus (and ACM's metrics collector, in `open-cluster-management-addon-observability`) | Scrapes istiod and the proxies of the listed namespaces and sends their Istio metrics to the hub |
 
 The Istio version is pinned (`ISTIO_VERSION` in `config/versions.env`, `istioVersion` in
 `charts/spoke-ossm/values.yaml`). The mesh starts with a tuning baseline that scopes each proxy's
 configuration and trims telemetry (`tuningBaseline` in that file); the tuning suite measures
 changes on top of it. The sync order and every chart are in [charts/README.md](charts/README.md).
+
+**Optional on OpenShift:** two add-ons, both off by default, give the hub one Kiali for every
+member. `acm_observability` turns on ACM Observability, which collects the members' Istio metrics
+on the hub; `kiali_multicluster` runs Kiali on the hub, reading each member remotely. They add
+scraping and pods on the members, so keep them off while a suite measures. How to turn them on:
+[terraform/platform/README.md](terraform/platform/README.md#openshift-add-ons-acm-observability-and-kiali).
 
 **During a test run**, each suite adds one namespace on the members it uses and removes it when
 it ends (the namespace and what it holds are in each suite's README):
@@ -354,6 +364,8 @@ For changing the harness (not needed to run it):
 - [BACKLOG.md](BACKLOG.md), [STRATEGY.md](STRATEGY.md): open work and the reasoning behind the
   suites.
 - [docs/scale-test-team](docs/scale-test-team/README.md): how harness changes are reviewed.
+- [docs/design](docs/design/kiali-acm-multicluster.md): the design of the OpenShift Kiali and ACM
+  Observability add-on, with what the build changed.
 
 ## License
 
