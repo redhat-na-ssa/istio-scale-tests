@@ -8,14 +8,16 @@ status: current
 
 How to stand up the ROSA path end to end (`terraform/rosa-hcp`, then `terraform/platform` in rosa
 mode, then a mesh check), run one cost-capped validation window on it, and tear it all down again.
-**4 ROSA clusters exist since 2026-10-29 16:59 UTC** (T0 in `~/.rosa-window/2026-10-29b/t0`): the
-same functional mesh rebuilt to validate the ACM Observability and multicluster Kiali add-ons,
-applied from a clean demo worktree `<home>/istio-scale-tests-demo-20261029` (detached at
-`81169f9`) with `acm_observability`, `kiali_multicluster`, the S3 bucket and the full-telemetry
-override on (Verify and recover, "Kiali and ACM Observability"). Validated live the same day,
-traffic graph included. No auto-teardown is armed (the owner tears it down after use; about
-$5.5/h plus about $0.30/day of observability storage); its window files are in
-`~/.rosa-window/2026-10-29b/`.
+**No ROSA clusters exist.** The 2026-10-29b build (T0 16:59 UTC): the same functional mesh
+rebuilt to validate the ACM Observability and multicluster Kiali add-ons, applied from a clean
+demo worktree (detached at `81169f9`) with `acm_observability`, `kiali_multicluster`, the S3
+bucket and the full-telemetry override on (Verify and recover, "Kiali and ACM Observability").
+Validated live the same day, traffic graph included, plus Kiali's Travels demo spread over the
+three members. Torn down at the owner's request with `003-auto-teardown.sh --now` from that
+worktree (started 19:17 UTC, `CLEAN` 20:09; the new bucket and IAM audit checks passed) and
+audited empty across all regions; its platform `rosa` workspace was discarded and the demo
+worktree removed. About $15 (an estimate: about 2 h 40 min at $5.5/h). Its window files are in
+`~/.rosa-window/2026-10-29b/` (`status.md`, `p9-audit.txt`).
 Earlier that day, the first build: the 2026-10-29 OSSM functional mesh (hub `cluster-001` plus members
 `cluster-002` to `cluster-004` at the small functional sizing, Re-run "Functional run"; T0 13:05
 UTC; applied from the session worktree `<repo>/.claude/worktrees/rosa-cluster-mesh-provision-8991bc`
@@ -101,7 +103,8 @@ audited empty on <date>".
   - `~/.rosa-window/by_cluster.json` is this run's saved copy (the default path of scripts 002 and
     003); `~/.rosa-window/2026-10-29/by_cluster.json` is the same copy.
   - No `rosa-autoteardown` or `rosa-warn` timer, and no phone alarms: the owner tears down by hand.
-- The 2026-10-29b run (Kiali and ACM Observability validation; clusters exist):
+- The 2026-10-29b run (Kiali and ACM Observability validation; destroyed and audited empty the
+  same day, its worktree and credentials file removed; kept as the procedure for the next one):
   - Worktree: `<home>/istio-scale-tests-demo-20261029`, detached at the branch commit Argo CD
     pins (`gitops_app_repo_revision`). It holds the state, the kubeconfig and the validated
     tfvars; move it to a new commit with `git -C <it> checkout --detach <sha>` plus the same
@@ -565,7 +568,7 @@ aws resourcegroupstaggingapi get-resources --tag-filters Key=purpose,Values=ossm
 8. Write `docs/campaigns/<date>-rosa-validation/README.md` from the template with placeholders, update this
    file's opening paragraph to the new state and commit it; check Cost Explorer at T+1 and T+2.
 
-For the 2026-10-29b build (clusters exist): when done, tear down from its demo worktree exactly
+For a build like 2026-10-29b (torn down 2026-10-29): when done, tear down from its demo worktree exactly
 as in Verify and recover, "Functional run teardown" (`003-auto-teardown.sh --now`, then discard the
 platform `rosa` workspace and run the audit; the rosa-hcp destroy also deletes the observability
 bucket and its contents), stop the traffic loop if it still runs, delete
