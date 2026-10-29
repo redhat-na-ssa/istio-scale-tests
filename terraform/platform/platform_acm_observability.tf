@@ -100,6 +100,12 @@ resource "kubernetes_secret_v1" "acm_observability_pull_secret" {
     ".dockerconfigjson" = data.kubernetes_secret_v1.hub_pull_secret[0].data[".dockerconfigjson"]
   }
 
+  # ACM labels Secrets in its namespace for its backup (cluster.open-cluster-management.io/backup);
+  # without this every plan removes the label again (2026-10-29 ROSA validation).
+  lifecycle {
+    ignore_changes = [metadata[0].labels]
+  }
+
   depends_on = [kubernetes_manifest.acm_observability_namespace]
 }
 
@@ -118,6 +124,9 @@ resource "kubernetes_secret_v1" "acm_observability_object_storage" {
   }
 
   lifecycle {
+    # ACM's backup label, as on the pull secret above.
+    ignore_changes = [metadata[0].labels]
+
     precondition {
       condition     = local.acm_observability_storage_configured
       error_message = local.use_kubeconfig ? "acm_observability needs the Thanos object storage config: set acm_observability_object_storage (thanos.yaml, as in the ACM Observability docs; pass it with TF_VAR_acm_observability_object_storage)." : "acm_observability needs the Thanos bucket: apply terraform/rosa-hcp with acm_observability_bucket = true first (its output acm_observability_storage is empty)."

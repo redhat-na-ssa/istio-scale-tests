@@ -761,6 +761,19 @@ cluster, and no sidecar workload runs there yet, so the metrics path is unproven
   `hub-mesh-ca-intermediate`, 31 for `hub-mesh-push-secrets` (a longer name leaves that member's
   Application with a ComparisonError). The Kiali preset sets a short `releaseName` and names its
   objects from `clusterName`; do the same for those three, or lower the variable's limit to 22.
+- Every rosa-mode `terraform/scripts/` helper (argocd-app-cleanup, cleanup-olm-csv,
+  olm-subscription-wait, argocd-controller-reshard, create-argocd-cluster-secret, and the new
+  mesh-metrics-cleanup) logs in with `kubectl --token=... --insecure-skip-tls-verify`, and the
+  generated ROSA kubeconfig sets `insecure-skip-tls-verify` too. ROSA API certificates are publicly
+  trusted, so verify them there; and pass the token in a temporary 0600 kubeconfig instead of argv.
+- The `terraform_data` cleanup and status-check resources carry `hub_admin_pass` (and the member
+  passwords) in `input`, which Terraform does not treat as sensitive: any plan that changes their
+  input prints the cluster-admin password in clear (seen in the 2026-10-29 validation). Wrap the
+  values in `sensitive()` or pass them through the environment from a sensitive local.
+- The kiali-ossm Subscription follows the `stable` channel with Automatic approval: on
+  2026-10-29 a fresh install went v2.27.5 (startingCSV) to v2.33.1 within minutes, alongside OSSM
+  3.4.4. Decide the pin (Manual approval with an approver step, or track the channel and document
+  the tested pair); the live validation ran on Kiali 2.33.1 with OSSM 3.4.4.
 
 ## Follow-ups found during the 2026-10-13 work
 
