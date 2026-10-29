@@ -8,7 +8,15 @@ status: current
 
 How to stand up the ROSA path end to end (`terraform/rosa-hcp`, then `terraform/platform` in rosa
 mode, then a mesh check), run one cost-capped validation window on it, and tear it all down again.
-**No ROSA clusters exist:** the 2026-10-29 OSSM functional mesh (hub `cluster-001` plus members
+**4 ROSA clusters exist since 2026-10-29 16:59 UTC** (T0 in `~/.rosa-window/2026-10-29b/t0`): the
+same functional mesh rebuilt to validate the ACM Observability and multicluster Kiali add-ons,
+applied from a clean demo worktree `<home>/istio-scale-tests-demo-20261029` (detached at
+`81169f9`) with `acm_observability`, `kiali_multicluster`, the S3 bucket and the full-telemetry
+override on (Verify and recover, "Kiali and ACM Observability"). Validated live the same day,
+traffic graph included. No auto-teardown is armed (the owner tears it down after use; about
+$5.5/h plus about $0.30/day of observability storage); its window files are in
+`~/.rosa-window/2026-10-29b/`.
+Earlier that day, the first build: the 2026-10-29 OSSM functional mesh (hub `cluster-001` plus members
 `cluster-002` to `cluster-004` at the small functional sizing, Re-run "Functional run"; T0 13:05
 UTC; applied from the session worktree `<repo>/.claude/worktrees/rosa-cluster-mesh-provision-8991bc`
 at `14218c4`, the first commit of the repo's new home `redhat-na-ssa/istio-scale-tests`; no
@@ -93,6 +101,19 @@ audited empty on <date>".
   - `~/.rosa-window/by_cluster.json` is this run's saved copy (the default path of scripts 002 and
     003); `~/.rosa-window/2026-10-29/by_cluster.json` is the same copy.
   - No `rosa-autoteardown` or `rosa-warn` timer, and no phone alarms: the owner tears down by hand.
+- The 2026-10-29b run (Kiali and ACM Observability validation; clusters exist):
+  - Worktree: `<home>/istio-scale-tests-demo-20261029`, detached at the branch commit Argo CD
+    pins (`gitops_app_repo_revision`). It holds the state, the kubeconfig and the validated
+    tfvars; move it to a new commit with `git -C <it> checkout --detach <sha>` plus the same
+    revision in `rosa.tfvars`, never by editing files there. Remove it only after the audit.
+  - State backups: `~/.rosa-window/2026-10-29b/{rosa-hcp,platform-rosa}.tfstate.backup` (0600).
+  - Logins: `cluster-admin` on every cluster, in `~/rosa-demo-credentials.txt` (0600, with the
+    Kiali and console URLs); the password comes from
+    `terraform -chdir=<worktree>/terraform/rosa-hcp output -raw cluster_admin_password`.
+  - The echo app was applied by hand from `charts/mesh-verify-appset.yaml` (filled from
+    `hub-gitops-root`, pinned to `471216b`); traffic came from a local curl loop through
+    `cluster-002`'s ingress (`~/.rosa-window/2026-10-29b/traffic.log`), which stops with the
+    session that started it.
 - Terraform state, in the window worktree: `terraform/rosa-hcp/terraform.tfstate` and the
   platform's `rosa` workspace (`terraform/platform/terraform.tfstate.d/rosa/`), both local and
   gitignored. rosa-hcp uses only its default workspace (the platform reads
@@ -155,6 +176,8 @@ terraform/rosa-hcp/terraform.tfvars.example -> terraform/rosa-hcp/terraform.tfva
 terraform/rosa-hcp/outputs.tf (local.kubeconfig_yaml) -> terraform/rosa-hcp/kubeconfig (merged kubeconfig, mode 0600)
 terraform/rosa-hcp/outputs.tf (output by_cluster) -> ~/.rosa-window/by_cluster.json (VPC and cluster ids read by scripts 002 and 003 after the state is gone; also copied to ~/.rosa-window/<date>/by_cluster.json)
 terraform/platform/terraform.tfvars.example -> terraform/platform/rosa.tfvars (cluster_provider = "rosa", repo URL and pinned revision, istiod 2 CPU/8Gi request and 4 CPU/16Gi limit, proxy 20m/64Mi requests, small Argo CD; the 2026-10-29 functional run: repo https://github.com/redhat-na-ssa/istio-scale-tests.git at 14218c4, istiod 1 replica 500m/2Gi request and 2 CPU/4Gi limit)
+terraform/platform/terraform.tfvars.example (OpenShift add-ons block) -> terraform/platform/rosa.tfvars (2026-10-29b, validated: acm_observability = { enabled = true }, kiali_multicluster = { enabled = true }, and under "spoke-ossm-appset" tuningBaseline = { telemetryFiltering = { enabled = false }, accessLogFiltering = { enabled = false } } for full telemetry)
+terraform/rosa-hcp/terraform.tfvars.example (acm_observability_bucket) -> terraform/rosa-hcp/terraform.tfvars (2026-10-29b: acm_observability_bucket = true, the S3 bucket and the STS role)
 terraform/rosa-hcp/terraform.tfstate -> ~/.rosa-window/2026-10-29/rosa-hcp.tfstate.backup (copy after the apply, in case the session worktree is removed)
 terraform/platform/terraform.tfstate.d/rosa/terraform.tfstate -> ~/.rosa-window/2026-10-29/platform-rosa.tfstate.backup (copy after the platform apply)
 tests/<suite>/configs/smoke.env -> tests/<suite>/configs/rosa-*.local.env (gitignored run configs with the real contexts)
@@ -253,6 +276,29 @@ Functional run (the 2026-10-29 shape, for trying OSSM configuration rather than 
   `oc -n istio-system get pod -l app=istiod -o jsonpath='{..resources.requests.memory}/{..resources.limits.memory}'`.
 - The mesh preflight, read-only plus an echo round trip from the hub:
   `KUBECONFIG=terraform/rosa-hcp/kubeconfig SETUP_CONTEXTS=cluster-002,cluster-003,cluster-004 tests/preflight/001-check-mesh.sh --hub-context cluster-001 --echo`.
+- Kiali and ACM Observability (validated 2026-10-29b, Kiali 2.33.1, OSSM 3.4.4, ACM 2.17.3):
+  - Order: apply rosa-hcp with `acm_observability_bucket = true` (6 resources, no cluster change),
+    then the platform with both add-ons (the add-on resources on the hub, the app-of-apps update);
+    every Application was Synced/Healthy about 5 minutes later.
+  - `oc --context cluster-001 get mco observability`: `Ready=True`; 34 pods Running in
+    `open-cluster-management-observability`. Early on it reports `Failed=True ... grafana is not
+    ready` for a minute or two; that clears.
+  - Each member: pods Running in `openshift-user-workload-monitoring`.
+  - Hub `istio-system`: the `kiali` pod Ready and three Secrets labelled `kiali.io/multiCluster=true`;
+    the Kiali log shows `Discovered cluster ... Accessible=true` for each member and
+    `Health refresh completed clusters=4 ... errors=0`.
+  - `oc get oauthclient kiali-istio-system -o jsonpath='{.redirectURIs}'`: on each member
+    `https://<hub-kiali-route>/api/auth/callback/<member>`, on the hub `.../api/auth/callback`.
+  - Metrics: port-forward `svc/observability-thanos-query-frontend` 9090 on the hub and query
+    `sum by (destination_cluster, reporter) (rate(istio_requests_total{destination_workload_namespace="mesh-verify"}[3m]))`:
+    a series per member, with `reporter="source"` too when full telemetry is on; the newest sample
+    is under about 70 s old at the 60 s interval.
+  - UI: log in on the hub as `cluster-admin`, then to each member from Kiali's profile menu; the
+    traffic graph of `mesh-verify` shows the ingress gateway on one member calling the echo app on
+    all three. The API with a hub-only token answers 403 "namespace not accessible" for member
+    namespaces: expected, it needs the per-member logins.
+  - The kiali-ossm Subscription moved from v2.27.5 to v2.33.1 on its own (Automatic, `stable`), and
+    the members got OSSM 3.4.4; the validation ran on that pair (BACKLOG, follow-ups).
 - mesh-verify through each member's ingress (`.status.loadBalancer.ingress[0].hostname` on AWS): answers come from every member.
   Through Classic LBs this fails intermittently (BACKLOG 9.8); the platform now gives the ingress
   an NLB in rosa mode (`rosa_ingress_nlb`), while the east-west gateway stays on a Classic LB.
@@ -518,6 +564,14 @@ aws resourcegroupstaggingapi get-resources --tag-filters Key=purpose,Values=ossm
    `003 --now` must start by T0+10:30.
 8. Write `docs/campaigns/<date>-rosa-validation/README.md` from the template with placeholders, update this
    file's opening paragraph to the new state and commit it; check Cost Explorer at T+1 and T+2.
+
+For the 2026-10-29b build (clusters exist): when done, tear down from its demo worktree exactly
+as in Verify and recover, "Functional run teardown" (`003-auto-teardown.sh --now`, then discard the
+platform `rosa` workspace and run the audit; the rosa-hcp destroy also deletes the observability
+bucket and its contents), stop the traffic loop if it still runs, delete
+`~/rosa-demo-credentials.txt`, remove the demo worktree once the audit is empty, and update this
+file's opening paragraph. Before that, the add-ons' turn-off path (toggle off, apply, check that
+the Kiali and metrics objects are gone) is the one part not yet run live.
 
 For the 2026-10-29 functional mesh, the loop is shorter: use the kubeconfig
 (`export KUBECONFIG=<worktree>/terraform/rosa-hcp/kubeconfig`; members `cluster-002` to
